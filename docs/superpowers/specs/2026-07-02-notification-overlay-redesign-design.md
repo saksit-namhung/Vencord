@@ -32,17 +32,17 @@ src/userplugins/notificationOverlay/
 
 Vencord's build system compiles TypeScript but does not automatically copy arbitrary asset files. To avoid a custom build step:
 
-- **`overlay.html`** — embedded as a template literal constant `OVERLAY_HTML` inside `native.ts`. Loaded via `win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(OVERLAY_HTML))`.
-- **`logViewer.html`** — embedded as a template literal constant `LOG_VIEWER_HTML` inside `native.ts`. Loaded the same way.
-- **`overlay-preload.js`** — a plain `.js` file (no TypeScript compilation needed) placed alongside `native.ts`. Referenced via `path.join(__dirname, "overlay-preload.js")` in `webPreferences.preload`. Vencord copies non-TS files in userplugin directories to the build output.
+- **Overlay HTML** — embedded as a template literal constant `OVERLAY_HTML` inside `native.ts`. Loaded via `win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(OVERLAY_HTML))`.
+- **Log viewer HTML** — embedded as a template literal constant `LOG_VIEWER_HTML` inside `native.ts`. Loaded the same way.
+- **`overlay-preload.js`** — a plain `.js` file (no TypeScript compilation needed) placed alongside `native.ts`. Referenced via `path.join(__dirname, "overlay-preload.js")` in `webPreferences.preload`. Vencord copies non-TS files in userplugin directories to the build output. **This single preload file is used by both the overlay window and the log viewer window.**
 
 Final file list:
 
 ```
 src/userplugins/notificationOverlay/
 ├── index.tsx            — REWRITE
-├── native.ts            — REWRITE (contains OVERLAY_HTML and LOG_VIEWER_HTML as constants)
-└── overlay-preload.js   — NEW
+├── native.ts            — REWRITE (OVERLAY_HTML and LOG_VIEWER_HTML as template literal constants)
+└── overlay-preload.js   — NEW (shared preload for both BrowserWindows)
 ```
 
 ---
@@ -56,16 +56,16 @@ Discord event (MESSAGE_CREATE / CALL_UPDATE)
   → index.tsx (renderer)
     → Native.showNotification(payload)         [IPC → main]
       → native.ts: append entry to JSON log
-      → native.ts: send IPC → overlay window   [notif-show]
-        → overlay.html: prepend card DOM node
+      → native.ts: win.webContents.send("notif-show", payload) → overlay
+        → overlay: prepend card DOM node
         → card auto-removes after timeout
-        → window resizes to fit remaining cards
+        → overlay sends overlay-resize → window height updates
 
 "View Logs" button in Vencord plugin settings
   → Native.openLogViewer()                     [IPC → main]
-    → native.ts: open logViewer BrowserWindow
-    → native.ts: read JSON → executeJavaScript("loadLogs(...)")
-    → logViewer.html: render timeline feed
+    → native.ts: open logViewer BrowserWindow (data: URL)
+    → on did-finish-load: win.webContents.send("log-data", entries)
+    → log viewer: loadLogs(entries) → render timeline feed
 ```
 
 ### Key Principle
@@ -91,9 +91,16 @@ Discord event (MESSAGE_CREATE / CALL_UPDATE)
 | `resizable` | `false` |
 | `movable` | `false` |
 
-Window width formula: `cardWidth + 16` px (16px padding). Window height formula: `(cardCount × 108) + 16` px. Window hides when `cardCount === 0`.
+Window width: `cardWidth + 16` px. Window hides when `cardCount === 0`.
 
-When the `cardWidth` setting changes, the new value takes effect on the **next notification** — the window is resized and `overlay.html` re-renders all current cards at the new width.
+The single authoritative height formula (defined in overlay page, sent to main via `overlay-resize`):
+```
+windowHeight = cardCount * CARD_HEIGHT + (cardCount - 1) * CARD_GAP + PADDING
+// CARD_HEIGHT=100, CARD_GAP=8, PADDING=16
+// 1 card → 116px, 2 cards → 224px, 5 cards → 548px
+```
+
+When the `cardWidth` setting changes, the new value takes effect on the **next notification** — the window is resized and the overlay re-renders all current cards at the new width.
 
 ### IPC Message: `notif-show`
 
@@ -259,37 +266,55 @@ webPreferences: {
 }
 ```
 
-A minimal preload (`overlay-preload.js`, also a new file) exposes a bridge:
+A minimal preload (`overlay-preload.js`, shared by both BrowserWindows) exposes a unified bridge:
 
-```ts
-// overlay-preload.js
+```js
+// overlay-preload.js  — shared by overlay window AND log viewer window
 const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("__bridge", {
-  onNotif: (cb: (p: NotifPayload) => void) => ipcRenderer.on("notif-show", (_, p) => cb(p)),
-  resize:  (h: number) => ipcRenderer.send("overlay-resize", h),
-  hide:    ()          => ipcRenderer.send("overlay-hide"),
+  // Overlay channels
+  onNotif:  (cb) => ipcRenderer.on("notif-show",   (_, p) => cb(p)),
+  resize:   (h)  => ipcRenderer.send("overlay-resize", h),
+  hide:     ()   => ipcRenderer.send("overlay-hide"),
+  // Log viewer channels
+  onLogData:   (cb) => ipcRenderer.on("log-data",    (_, entries) => cb(entries)),
+  onLogCleared:(cb) => ipcRenderer.on("log-cleared", ()           => cb()),
+  clearLog:    ()   => ipcRenderer.send("log-clear"),
+  openUrl:     (url)=> ipcRenderer.send("log-open-url", { url }),
 });
 ```
 
+Each page only uses the channels relevant to it — the overlay ignores log channels and vice versa.
+
 ### Page-Ready Sequencing
 
-1. `native.ts` calls `win.loadFile("overlay.html")`
-2. `overlay.html` fires `window.__bridge.onNotif(handler)` in its `<script>` on DOMContentLoaded
+1. `native.ts` calls `win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(OVERLAY_HTML))` (embedded template literal — **not** `loadFile`)
+2. Overlay page registers `window.__bridge.onNotif(handler)` on `DOMContentLoaded`
 3. `native.ts` waits for the `did-finish-load` event before sending any `notif-show` messages
-4. Notifications that arrive before `did-finish-load` are queued in a `pending: NotifPayload[]` array in `native.ts` and flushed after the event fires
+4. Notifications that arrive before `did-finish-load` are queued in a `pending: NotifPayload[]` array in `native.ts` and flushed once the event fires
+
+Log viewer follows the same sequencing: `did-finish-load` fires → `native.ts` sends `log-data`.
 
 ### Full IPC Channel Table
+
+**Overlay window:**
 
 | Channel | Direction | Payload | Handler |
 |---|---|---|---|
 | `notif-show` | main → overlay | `NotifPayload` | Prepend card, resize |
-| `overlay-resize` | overlay → main | `{ height: number }` | `win.setSize(cardWidth + 16, height)` |
+| `overlay-resize` | overlay → main | `number` (height px) | `win.setSize(cardWidth + 16, height)` |
 | `overlay-hide` | overlay → main | — | `win.hide()` |
-| `log-clear` | logViewer → main | — | Wipe JSON, send `log-cleared` |
-| `log-cleared` | main → logViewer | — | Viewer clears feed in-place |
-| `log-open-url` | logViewer → main | `{ url: string }` | Main validates URL (must start with `discord://-/channels/`), then calls `shell.openExternal(url)`. URLs failing validation are silently ignored. |
 
-All external URLs (Discord deep links, image thumbnails) are opened via `shell.openExternal` in main — never `window.open` in the renderer.
+**Log viewer window:**
+
+| Channel | Direction | Payload | Handler |
+|---|---|---|---|
+| `log-data` | main → logViewer | `LogEntry[]` | `loadLogs(entries)` — render timeline |
+| `log-clear` | logViewer → main | — | Wipe JSON to `[]`; send `log-cleared` back |
+| `log-cleared` | main → logViewer | — | Clear feed in-place; show empty state |
+| `log-open-url` | logViewer → main | `{ url: string }` | Validate URL starts with `discord://-/channels/`; call `shell.openExternal(url)`. Invalid URLs silently ignored. |
+
+All external URLs are opened via `shell.openExternal` in main — never `window.open` in the renderer.
 
 ---
 
@@ -305,19 +330,13 @@ In `index.tsx`, implemented as a setting of type `OptionType.COMPONENT` renderin
 
 ### Population
 
-`native.ts` reads the JSON file and populates the viewer via **`win.webContents.send("log-data", entries)`** (Electron IPC). The `logViewer.html` preload (reuses `overlay-preload.js` bridge pattern, or inline `<script>` using `window.__bridge`) calls `ipcRenderer.on("log-data", (_, entries) => loadLogs(entries))`.
+`native.ts` reads the JSON file on `did-finish-load` and sends entries via `win.webContents.send("log-data", entries)`. The log viewer page receives them via `window.__bridge.onLogData(loadLogs)`.
 
 The viewer shows a **snapshot** of the log at the time it was opened. It does not live-update as new notifications arrive.
 
-### IPC Surface (viewer → main)
+### IPC
 
-| IPC channel | Direction | Payload | Effect |
-|---|---|---|---|
-| `log-clear` | renderer → main | — | Wipes JSON file to `[]`; main sends `log-cleared` back |
-| `log-cleared` | main → renderer | — | Viewer re-renders with empty feed and shows "No notifications yet" state |
-| `log-open-url` | renderer → main | `{ url: string }` | Main validates URL (must start with `discord://-/channels/`), then calls `shell.openExternal(url)`. URLs failing validation are silently ignored. |
-
-**Clear Log flow:** User clicks "🗑 Clear Log" → renderer sends `log-clear` → main wipes file → main sends `log-cleared` → viewer clears feed in-place (no window close/reopen).
+All log viewer IPC channels are defined in the Full IPC Channel Table above. The log viewer uses: `log-data` (receive), `log-clear` (send), `log-cleared` (receive), `log-open-url` (send).
 
 ### Layout
 
@@ -349,14 +368,16 @@ Each entry shows:
 
 All configurable in Discord → Vencord Settings → Plugins → NotificationOverlay (⚙️). No Discord restart required.
 
-| Setting | Type | Default | When it takes effect |
-|---|---|---|---|
-| `timeout` | Number | `5` | Next notification shown |
-| `maxCards` | Number | `5` | Immediately — if current card count exceeds new value, excess oldest cards are removed |
-| `cardWidth` | Number | `420` | Next notification shown — window and all cards resize at that point |
-| `dmNotifications` | Boolean | `true` | Immediately (next event) |
-| `serverNotifications` | Boolean | `true` | Immediately (next event) |
-| `callNotifications` | Boolean | `true` | Immediately (next event) |
+| Setting | Type | Default | Valid Range | When it takes effect |
+|---|---|---|---|---|
+| `timeout` | Number | `5` | 1–60 (clamped) | Next notification shown |
+| `maxCards` | Number | `5` | 1–10 (clamped) | Immediately — excess oldest cards removed if current count exceeds new value |
+| `cardWidth` | Number | `420` | 280–600 (clamped) | Next notification shown |
+| `dmNotifications` | Boolean | `true` | — | Immediately (next event) |
+| `serverNotifications` | Boolean | `true` | — | Immediately (next event) |
+| `callNotifications` | Boolean | `true` | — | Immediately (next event) |
+
+Values outside the valid range are clamped silently in `native.ts` before use. Invalid types (e.g. non-numeric) fall back to the default.
 
 ---
 
