@@ -22,10 +22,11 @@ The plugin already has `index.tsx` and `native.ts`. Both are **rewritten** as pa
 
 ```
 src/userplugins/notificationOverlay/
-├── index.tsx        — REWRITE: renderer flux listeners, settings, IPC bridge calls
-├── native.ts        — REWRITE: overlay window, log file I/O, IPC handlers
-├── overlay.html     — NEW: persistent overlay page; cards added/removed via IPC
-└── logViewer.html   — NEW: standalone log website; populated via executeJavaScript
+├── index.tsx            — REWRITE: renderer flux listeners, settings, IPC bridge calls
+├── native.ts            — REWRITE: overlay window, log file I/O, IPC handlers
+├── overlay.html         — NEW: persistent overlay page; cards added/removed via IPC
+├── overlay-preload.js   — NEW: contextBridge preload for overlay window
+└── logViewer.html       — NEW: standalone log website; populated via executeJavaScript
 ```
 
 ---
@@ -177,9 +178,80 @@ Applied in `index.tsx` before passing body to native:
 | `__(.+?)__` | `$1` (strip underline) |
 | `` `(.+?)` `` | `$1` (strip inline code) |
 
---- (`logViewer.html`)
+---
 
-### Access
+## Notification Trigger Rules (`index.tsx`)
+
+### MESSAGE_CREATE
+
+A notification is shown only when **all** of the following are true:
+
+| Condition | Detail |
+|---|---|
+| Not optimistic | `optimistic === false` |
+| Not own message | `message.author.id !== UserStore.getCurrentUser().id` |
+| Not a bot | `message.author.bot !== true` |
+| Should notify | `notificationsShouldNotify(message, message.channel_id)` returns true (handles muted channels, suppressed notifications, Do Not Disturb) |
+| Channel exists | `ChannelStore.getChannel(message.channel_id)` is non-null |
+| Setting enabled | DM/Group DM → `dmNotifications`; server channel → `serverNotifications` |
+
+### CALL_UPDATE
+
+A call notification is shown only when:
+- `call.ringing` array includes the current user's ID
+- `settings.store.callNotifications` is true
+- Deduplication: a call notification for the same `channel_id` is not shown again until the call stops ringing (tracked via a `Set<string>` of active ringing channel IDs in `native.ts`, cleared on next `CALL_UPDATE` where the channel is no longer ringing)
+
+---
+
+## Overlay IPC Contract
+
+### webPreferences for `overlay.html` BrowserWindow
+
+```ts
+webPreferences: {
+  nodeIntegration: false,
+  contextIsolation: true,
+  sandbox: false,          // must be false to allow preload
+  preload: path.join(__dirname, "overlay-preload.js"),
+}
+```
+
+A minimal preload (`overlay-preload.js`, also a new file) exposes a bridge:
+
+```ts
+// overlay-preload.js
+const { contextBridge, ipcRenderer } = require("electron");
+contextBridge.exposeInMainWorld("__bridge", {
+  onNotif: (cb: (p: NotifPayload) => void) => ipcRenderer.on("notif-show", (_, p) => cb(p)),
+  resize:  (h: number) => ipcRenderer.send("overlay-resize", h),
+  hide:    ()          => ipcRenderer.send("overlay-hide"),
+});
+```
+
+### Page-Ready Sequencing
+
+1. `native.ts` calls `win.loadFile("overlay.html")`
+2. `overlay.html` fires `window.__bridge.onNotif(handler)` in its `<script>` on DOMContentLoaded
+3. `native.ts` waits for the `did-finish-load` event before sending any `notif-show` messages
+4. Notifications that arrive before `did-finish-load` are queued in a `pending: NotifPayload[]` array in `native.ts` and flushed after the event fires
+
+### Full IPC Channel Table
+
+| Channel | Direction | Payload | Handler |
+|---|---|---|---|
+| `notif-show` | main → overlay | `NotifPayload` | Prepend card, resize |
+| `overlay-resize` | overlay → main | `{ height: number }` | `win.setSize(cardWidth + 16, height)` |
+| `overlay-hide` | overlay → main | — | `win.hide()` |
+| `log-clear` | logViewer → main | — | Wipe JSON, send `log-cleared` |
+| `log-cleared` | main → logViewer | — | Viewer clears feed in-place |
+| `log-open-url` | logViewer → main | `{ url: string }` | `shell.openExternal(url)` |
+
+All external URLs (Discord deep links, image thumbnails) are opened via `shell.openExternal` in main — never `window.open` in the renderer.
+
+---
+
+## Log Viewer Website (`logViewer.html`)
 
 Button in Vencord plugin settings panel: **"📋 View Notification Log"**
 Calls `Native.openLogViewer()` → opens a new `BrowserWindow` (1000×700px, framed, not always-on-top).
@@ -231,16 +303,16 @@ Each entry shows:
 
 ## Plugin Settings
 
-All configurable in Discord → Vencord Settings → Plugins → NotificationOverlay (⚙️). Changes apply instantly with no restart.
+All configurable in Discord → Vencord Settings → Plugins → NotificationOverlay (⚙️). No Discord restart required.
 
-| Setting | Type | Default | Description |
+| Setting | Type | Default | When it takes effect |
 |---|---|---|---|
-| `timeout` | Number | `5` | Seconds each card stays visible |
-| `maxCards` | Number | `5` | Max cards on screen at once |
-| `cardWidth` | Number | `420` | Overlay card width in px |
-| `dmNotifications` | Boolean | `true` | Show DM notifications |
-| `serverNotifications` | Boolean | `true` | Show server message notifications |
-| `callNotifications` | Boolean | `true` | Show incoming call notifications |
+| `timeout` | Number | `5` | Next notification shown |
+| `maxCards` | Number | `5` | Immediately — if current card count exceeds new value, excess oldest cards are removed |
+| `cardWidth` | Number | `420` | Next notification shown — window and all cards resize at that point |
+| `dmNotifications` | Boolean | `true` | Immediately (next event) |
+| `serverNotifications` | Boolean | `true` | Immediately (next event) |
+| `callNotifications` | Boolean | `true` | Immediately (next event) |
 
 ---
 
@@ -249,8 +321,9 @@ All configurable in Discord → Vencord Settings → Plugins → NotificationOve
 - **Avatar load failure:** `onerror="this.style.display='none'"` — fallback emoji shown instead
 - **Image load failure:** same `onerror` pattern
 - **JSON file missing/corrupt:** catch on read → treat as empty array, write fresh `[]`
-- **Overlay window destroyed unexpectedly:** `ensureWindow()` recreates it on next notification
-- **`discord://` deep link on unsupported OS:** `window.open()` silently fails — no user-visible error needed
+- **Overlay window destroyed unexpectedly:** `ensureWindow()` recreates it and reloads `overlay.html` on next notification; pending queue mechanism handles the ready-sequencing again
+- **`discord://` deep link:** opened via `shell.openExternal` in main process — silently no-ops if Discord is not installed; no user-visible error needed
+- **logViewer opened twice:** if a `logViewer` window already exists and is not destroyed, `openLogViewer()` focuses it instead of opening a second one
 
 ---
 
