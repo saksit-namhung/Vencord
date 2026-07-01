@@ -18,7 +18,7 @@ Upgrade the existing `NotificationOverlay` Vencord plugin with three major impro
 
 ## Files
 
-The plugin already has `index.tsx` and `native.ts`. Both are **rewritten** as part of this redesign. Three new files are added:
+The plugin already has `index.tsx` and `native.ts`. Both are **rewritten** as part of this redesign. One new file is added:
 
 ```
 src/userplugins/notificationOverlay/
@@ -34,7 +34,7 @@ Vencord's build system compiles TypeScript but does not automatically copy arbit
 
 - **Overlay HTML** — embedded as a template literal constant `OVERLAY_HTML` inside `native.ts`. Loaded via `win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(OVERLAY_HTML))`.
 - **Log viewer HTML** — embedded as a template literal constant `LOG_VIEWER_HTML` inside `native.ts`. Loaded the same way.
-- **`overlay-preload.js`** — a plain `.js` file (no TypeScript compilation needed) placed alongside `native.ts`. Referenced via `path.join(__dirname, "overlay-preload.js")` in `webPreferences.preload`. Vencord copies non-TS files in userplugin directories to the build output. **This single preload file is used by both the overlay window and the log viewer window.**
+- **`overlay-preload.js`** — a plain `.js` file (no TypeScript compilation needed) placed alongside `native.ts`. Referenced via `path.join(__dirname, "overlay-preload.js")` in `webPreferences.preload`. Vencord copies non-TS files in userplugin directories to the build output alongside compiled JS. **Implementation note:** verify `__dirname` resolves correctly in Vencord's native plugin context at runtime before committing to this path strategy. If it does not, the fallback is to inline the bridge using `webContents.executeJavaScript` after `did-finish-load` instead of a preload file.
 
 Final file list:
 
@@ -90,6 +90,8 @@ Discord event (MESSAGE_CREATE / CALL_UPDATE)
 | `skipTaskbar` | `true` |
 | `resizable` | `false` |
 | `movable` | `false` |
+
+After creation: `win.setIgnoreMouseEvents(true)` — the overlay is fully click-through; all mouse events pass to the window beneath it. This is intentional: clicking overlay cards is out of scope (see Out of Scope section).
 
 Window width: `cardWidth + 16` px. Window hides when `cardCount === 0`.
 
@@ -235,6 +237,7 @@ const ringingChannels = new Set<string>();
 
 flux: {
   CALL_UPDATE({ call }) {
+    if (!settings.store.callNotifications) return;
     const channelId: string = call.channel_id;
     const isRinging: boolean = call?.ringing?.includes(currentUserId);
 
