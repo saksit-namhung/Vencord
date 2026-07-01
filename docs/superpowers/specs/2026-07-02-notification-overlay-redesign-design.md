@@ -18,15 +18,15 @@ Upgrade the existing `NotificationOverlay` Vencord plugin with three major impro
 
 ## Files
 
+The plugin already has `index.tsx` and `native.ts`. Both are **rewritten** as part of this redesign. Two new files are added:
+
 ```
 src/userplugins/notificationOverlay/
-├── index.tsx        — renderer: flux listeners, settings, IPC bridge calls
-├── native.ts        — Electron main: overlay window, log file I/O, IPC handlers
-├── overlay.html     — persistent overlay page; cards added/removed via IPC
-└── logViewer.html   — standalone log website; populated via executeJavaScript
+├── index.tsx        — REWRITE: renderer flux listeners, settings, IPC bridge calls
+├── native.ts        — REWRITE: overlay window, log file I/O, IPC handlers
+├── overlay.html     — NEW: persistent overlay page; cards added/removed via IPC
+└── logViewer.html   — NEW: standalone log website; populated via executeJavaScript
 ```
-
-`.gitignore` addition: `.superpowers/`
 
 ---
 
@@ -74,7 +74,9 @@ Discord event (MESSAGE_CREATE / CALL_UPDATE)
 | `resizable` | `false` |
 | `movable` | `false` |
 
-Window height formula: `(cardCount × 108) + 16` px. Window hides when `cardCount === 0`.
+Window width formula: `cardWidth + 16` px (16px padding). Window height formula: `(cardCount × 108) + 16` px. Window hides when `cardCount === 0`.
+
+When the `cardWidth` setting changes, the new value takes effect on the **next notification** — the window is resized and `overlay.html` re-renders all current cards at the new width.
 
 ### IPC Message: `notif-show`
 
@@ -85,7 +87,7 @@ interface NotifPayload {
   id: string;           // unique: `${Date.now()}-${Math.random().toString(36).slice(2,7)}`
   title: string;        // username / "📞 Incoming Call"
   serverLine: string;   // "#channel · Server Name" | "Direct Message" | "Voice Chat"
-  body: string;         // message text, stripped of Discord markup
+  body: string;         // message text, stripped of Discord markup (see rules below)
   avatarUrl: string;    // CDN URL or "" for calls
   type: "dm" | "server" | "call";
   timeout: number;      // seconds from settings
@@ -105,7 +107,7 @@ interface NotifPayload {
 
 ## Card Design (Compact+)
 
-**Dimensions:** 420px wide × ~100px tall per card, 8px gap between cards
+**Dimensions:** `cardWidth` px wide (default 420) × ~100px tall per card, 8px gap between cards
 
 **Layout:**
 ```
@@ -160,9 +162,22 @@ interface LogEntry {
 - **On plugin start (Discord launch):** read JSON → filter out entries where `Date.now() - timestamp > 30 * 24 * 60 * 60 * 1000` → write pruned array back
 - **On "Clear Log":** wipe array → write empty `[]` to JSON
 
----
+### Discord Markup Stripping Rules
 
-## Log Viewer Website (`logViewer.html`)
+Applied in `index.tsx` before passing body to native:
+
+| Pattern | Replacement |
+|---|---|
+| `<@!?(\d+)>` | `@user` |
+| `<#(\d+)>` | `#channel` |
+| `<@&(\d+)>` | `@role` |
+| `<:[^:]+:\d+>` | `[emoji]` |
+| `<a:[^:]+:\d+>` | `[emoji]` |
+| `\*\*(.+?)\*\*` | `$1` (strip bold) |
+| `__(.+?)__` | `$1` (strip underline) |
+| `` `(.+?)` `` | `$1` (strip inline code) |
+
+--- (`logViewer.html`)
 
 ### Access
 
@@ -175,6 +190,18 @@ Calls `Native.openLogViewer()` → opens a new `BrowserWindow` (1000×700px, fra
 ```js
 webContents.executeJavaScript(`loadLogs(${JSON.stringify(entries)})`)
 ```
+
+The viewer shows a **snapshot** of the log at the time it was opened. It does not live-update as new notifications arrive.
+
+### IPC Surface (viewer → main)
+
+| IPC channel | Direction | Payload | Effect |
+|---|---|---|---|
+| `log-clear` | renderer → main | — | Wipes JSON file to `[]`; main sends `log-cleared` back |
+| `log-cleared` | main → renderer | — | Viewer re-renders with empty feed and shows "No notifications yet" state |
+| `log-open-url` | renderer → main | `{ url: string }` | Main calls `shell.openExternal(url)` to open Discord deep link |
+
+**Clear Log flow:** User clicks "🗑 Clear Log" → renderer sends `log-clear` → main wipes file → main sends `log-cleared` → viewer clears feed in-place (no window close/reopen).
 
 ### Layout
 
