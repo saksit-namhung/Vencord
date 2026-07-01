@@ -144,7 +144,7 @@ function clearLog(): void {
     saveLog();
 }
 
-// Called once on plugin start from the exported start function below.
+// Called once at module load — prunes entries older than 30 days.
 loadLog();
 
 // ─── Settings helpers ─────────────────────────────────────────────────────────
@@ -1088,49 +1088,57 @@ Verify each behavior:
 
 - [ ] **Step 3: Verify `__dirname` resolves to preload**
 
-Open Discord's DevTools for the overlay BrowserWindow (from Discord's DevTools → process list, find the overlay window). In its console run: `window.__bridge`
+Open Discord's DevTools for the overlay BrowserWindow (from Discord's DevTools → process list). In its console run: `window.__bridge`
 
 **If `window.__bridge` is defined:** preload works. No action needed.
 
-**If `window.__bridge` is `undefined`:** the preload file path did not resolve. Apply the concrete fallback:
+**If `window.__bridge` is `undefined`:** apply this concrete fallback — remove the preload entirely and drive everything from main via `executeJavaScript`:
 
-1. Remove `preload: PRELOAD` from both BrowserWindow `webPreferences` blocks in `native.ts`
-2. Change both `sandbox: false` back to `sandbox: true`
-3. Replace the `did-finish-load` flush loop in `ensureOverlay` with this pattern:
+1. Remove `preload: PRELOAD` and change `sandbox: false` → `sandbox: true` in both BrowserWindow configs.
 
+2. In `native.ts`, replace the `webContents.send("notif-show", p)` call with:
 ```ts
-overlayWin.webContents.once("did-finish-load", () => {
-    // Inject bridge via executeJavaScript (fallback when preload file not found)
-    overlayWin!.webContents.executeJavaScript(`
-        window.__ipc_handlers = {};
-        window.__bridge = {
-            onNotif:  (cb) => { window.__ipc_handlers.notif = cb; },
-            resize:   (h)  => { window.__ipc_resize && window.__ipc_resize(h); },
-            hide:     ()   => { window.__ipc_hide   && window.__ipc_hide(); },
-        };
-    `).then(() => {
-        overlayReady = true;
-        for (const p of pendingNotifs) {
-            overlayWin!.webContents.executeJavaScript(
-                `window.__ipc_handlers.notif && window.__ipc_handlers.notif(${JSON.stringify(p)})`
-            );
-        }
-        pendingNotifs = [];
-    });
-    // Receive resize/hide from page via executeJavaScript polling is impractical.
-    // Instead, expose resize/hide as named functions the page calls directly:
-    // In OVERLAY_HTML <script>, replace window.__bridge.resize(h) with
-    // window.__ipc_resize(h) and provide a shim:
-    //   window.__ipc_resize = (h) => { /* no-op in fallback — size window from main */ }
-    // Then use a MutationObserver on #stack to count cards and send resize from main.
-});
+win.webContents.executeJavaScript(`handleNotif(${JSON.stringify(notifMsg)})`);
 ```
 
-4. In `OVERLAY_HTML`, update the `resize()` and `hide()` calls to guard: `if (window.__bridge?.resize) window.__bridge.resize(h);`
-5. Add a comment in native.ts: `// FALLBACK: preload not available, using executeJavaScript bridge`
-6. Re-build and re-verify `window.__bridge` is available.
+3. In `OVERLAY_HTML`, rename the `window.__bridge.onNotif(...)` setup to a plain global function:
+```html
+<script>
+function handleNotif(p) { /* existing card logic */ }
+</script>
+```
 
-- [ ] **Step 4: Final commit**
+4. Replace `window.__bridge.resize(h)` and `window.__bridge.hide()` calls in OVERLAY_HTML with direct `fetch` calls to a tiny local HTTP endpoint — OR — remove them and instead have `native.ts` poll card count from the page every 200ms using:
+```ts
+setInterval(async () => {
+    if (!overlayWin || overlayWin.isDestroyed()) return;
+    const count = await overlayWin.webContents.executeJavaScript(
+        "document.getElementById('stack').children.length"
+    );
+    const h = count === 0 ? 0 : count * 100 + (count - 1) * 8 + 16;
+    if (count === 0) overlayWin.hide();
+    else overlayWin.setSize(overlayWin.getBounds().width, h);
+}, 200);
+```
+
+5. For the log viewer, similarly replace `win.webContents.send("log-data", entries)` with:
+```ts
+win.webContents.executeJavaScript(`loadLogs(${JSON.stringify(logEntries)})`);
+```
+And `win.webContents.send("log-cleared")` with:
+```ts
+win.webContents.executeJavaScript("loadLogs([])");
+```
+
+6. Remove all `ipcMain.on(...)` handlers that are no longer needed (overlay-resize, overlay-hide, log-open-url still needs a solution — use `webContents.setWindowOpenHandler` or add a tiny express server for outbound events). Simplest: keep `contextBridge` just for `openUrl`/`openImage` if partial preload works; otherwise omit image/URL opening entirely and document as known limitation.
+
+7. Re-build and re-verify.
+
+**Log storage edge cases:**
+- [ ] Manually corrupt `vencord-notification-log.json` (write `"not json"` to it), restart Discord — verify the log viewer opens with an empty feed (no crash)
+- [ ] To verify 30-day pruning: open `vencord-notification-log.json` in a text editor, manually set one entry's `timestamp` to `Date.now() - 31 * 24 * 60 * 60 * 1000`, save, restart Discord — verify that entry does not appear in the log viewer
+- [ ] To verify settings clamp: set `cardWidth` to `9999` in plugin settings, send a message — verify window width is capped at `616px` (600 + 16)
+- [ ] To verify `maxCards` immediate effect: with 4 cards visible, reduce `maxCards` to `2` in settings — verify the 2 oldest cards are removed immediately
 
 ```
 git add -A
