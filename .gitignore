@@ -1,5 +1,6 @@
 dist
 node_modules
+.worktrees
 
 *.exe
 vencord_installer
