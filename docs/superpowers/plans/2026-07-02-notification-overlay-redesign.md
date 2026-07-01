@@ -762,7 +762,12 @@ maxCards: {
 
 No `start()`/`stop()` changes needed. The `onChange` hook is the authoritative pattern used throughout Vencord (see `src/api/PluginManager.ts:386`).
 
+- [ ] **Step 4: Build to verify**
 
+Run: `pnpm build 2>&1 | Select-String -Pattern "error|Error" | Select-Object -First 20`
+Expected: no errors from `notificationOverlay`
+
+- [ ] **Step 5: Commit**
 
 ```
 git add src/userplugins/notificationOverlay/index.tsx
