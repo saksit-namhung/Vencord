@@ -719,9 +719,9 @@ export default definePlugin({
 });
 ```
 
-- [ ] **Step 3b: Add `maxCards` immediate-effect via settings subscriber**
+- [ ] **Step 3b: Add `maxCards` immediate-effect via settings `onChange` and IPC**
 
-Per spec, reducing `maxCards` in settings must **immediately** trim visible cards — not wait for the next notification. Implement this by:
+Per spec, reducing `maxCards` in settings must **immediately** trim visible cards — not wait for the next notification.
 
 **In `native.ts`**, add a `trimToMaxCards` export (after `showNotification`):
 ```ts
@@ -735,9 +735,9 @@ export function trimToMaxCards(_: any, max: number): void {
 **In `OVERLAY_HTML`** `<script>`, add a handler for the `notif-trim` IPC message (alongside the existing `notif-show` listener):
 ```js
 window.__bridge.onTrim((max) => {
-    // Remove oldest cards (first children) until count ≤ max
+    // Newest card is at the top (prepended), oldest is lastElementChild
     while (stack.children.length > max) {
-        stack.removeChild(stack.firstElementChild);
+        stack.removeChild(stack.lastElementChild);
     }
     resize();
 });
@@ -745,24 +745,22 @@ window.__bridge.onTrim((max) => {
 
 **In `overlay-preload.js`**, expose `onTrim` on the bridge (alongside `onNotif`):
 ```js
-onTrim:  (cb) => ipcRenderer.on("notif-trim", (_, max) => cb(max)),
+onTrim: (cb) => ipcRenderer.on("notif-trim", (_, max) => cb(max)),
 ```
 
-**In `index.tsx`**, add a settings listener in the plugin object's `start()` lifecycle method:
+**In `index.tsx`**, add `onChange` to the `maxCards` setting definition (Vencord calls `onChange` on every settings change via `SettingsStore.addChangeListener` in PluginManager — no manual subscription needed):
 ```tsx
-start() {
-    // Trim overlay cards immediately when maxCards is reduced
-    this._unsubMaxCards = settings.store.addChangeListener?.("maxCards",
-        (val: number) => Native.trimToMaxCards(val)
-    );
-    // Fallback: if addChangeListener is not available, skip — trimming at notification-time is still enforced
-},
-stop() {
-    this._unsubMaxCards?.();
+maxCards: {
+    type: OptionType.NUMBER,
+    description: "Max notification cards visible at once (1–10)",
+    default: 5,
+    onChange(val: number) {
+        Native.trimToMaxCards(val);
+    },
 },
 ```
 
-> **Note:** `settings.store.addChangeListener` is the Vencord proxyLazy store API. If this method does not exist at runtime, the immediate-trim behavior degrades gracefully to trim-on-next-notification (which is still enforced by the `while (p.maxCards && stack.children.length >= p.maxCards)` loop in OVERLAY_HTML). Verify after implementation whether the change listener fires — if it does not, remove the dead code.
+No `start()`/`stop()` changes needed. The `onChange` hook is the authoritative pattern used throughout Vencord (see `src/api/PluginManager.ts:386`).
 
 
 
@@ -1162,6 +1160,8 @@ win.webContents.executeJavaScript("loadLogs([])");
 - [ ] To verify settings clamp: set `cardWidth` to `9999` in plugin settings, send a message — verify window width is capped at `616px` (600 + 16)
 - [ ] To verify `maxCards` immediate effect: with 4 cards visible, reduce `maxCards` to `2` in settings — verify the 2 oldest cards are removed immediately
 
+- [ ] **Step 4: Final commit**
+
 ```
 git add -A
 git commit -m "feat(notif-overlay): complete NotificationOverlay redesign — stacking, expanded cards, log viewer"
@@ -1171,8 +1171,9 @@ git commit -m "feat(notif-overlay): complete NotificationOverlay redesign — st
 
 ## Push to GitHub
 
-- [ ] **Push to remote**
+- [ ] **Push to the active branch**
 
 ```
-git push origin main
+git push
 ```
+
