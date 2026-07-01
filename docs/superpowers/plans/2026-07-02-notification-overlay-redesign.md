@@ -490,26 +490,7 @@ Then run Discord with the plugin enabled and open DevTools for the overlay Brows
 In the console, type: `window.__bridge`
 Expected: object with `onNotif`, `resize`, `hide`, etc.
 
-If `window.__bridge` is `undefined`, the preload did not load. Apply the fallback immediately:
-- Remove `preload: PRELOAD` from the BrowserWindow `webPreferences`
-- Add a `did-finish-load` handler that injects the bridge via `executeJavaScript`:
-```ts
-overlayWin.webContents.once("did-finish-load", () => {
-    overlayWin!.webContents.executeJavaScript(`
-        window.__bridge = {
-            onNotif:     (cb) => { window.__onNotif = cb; },
-            resize:      (h)  => { window.__ipc_resize(h); },
-            hide:        ()   => { window.__ipc_hide(); },
-        };
-    `);
-    // Then use webContents.send for IPC as-is — Vencord's existing
-    // nodeIntegration=false context will still receive webContents.send events
-    // because the preload registers ipcRenderer listeners we inject above.
-    // Actually in this fallback, wire resize/hide via executeJavaScript callbacks
-    // and send notif-show payload via webContents.executeJavaScript("handleNotif(payload)") instead.
-});
-```
-Document which path was taken in a code comment.
+If `window.__bridge` is `undefined`, the preload did not load. Apply the complete concrete fallback documented in **Task 6, Step 3**. Do not improvise an alternative here — follow those steps exactly.
 
 - [ ] **Step 5: Commit**
 
@@ -636,7 +617,7 @@ function getImageUrls(message: any): string[] {
 export default definePlugin({
     name: "NotificationOverlay",
     description: "Shows Discord notifications as an always-on-top overlay visible over any app or window, with a persistent notification log",
-    authors: [{ name: "Me", id: 0n }],
+    authors: [{ name: "Me", id: 0n }], // personal userplugin — matches existing plugin convention
     settings,
 
     flux: {
@@ -738,12 +719,52 @@ export default definePlugin({
 });
 ```
 
-- [ ] **Step 4: Build to verify**
+- [ ] **Step 3b: Add `maxCards` immediate-effect via settings subscriber**
 
-Run: `pnpm build 2>&1 | Select-String -Pattern "error|Error" | Select-Object -First 20`
-Expected: no errors from `notificationOverlay`
+Per spec, reducing `maxCards` in settings must **immediately** trim visible cards — not wait for the next notification. Implement this by:
 
-- [ ] **Step 5: Commit**
+**In `native.ts`**, add a `trimToMaxCards` export (after `showNotification`):
+```ts
+export function trimToMaxCards(_: any, max: number): void {
+    if (!overlayWin || overlayWin.isDestroyed()) return;
+    const clamped = Math.max(1, Math.min(10, max));
+    overlayWin.webContents.send("notif-trim", clamped);
+}
+```
+
+**In `OVERLAY_HTML`** `<script>`, add a handler for the `notif-trim` IPC message (alongside the existing `notif-show` listener):
+```js
+window.__bridge.onTrim((max) => {
+    // Remove oldest cards (first children) until count ≤ max
+    while (stack.children.length > max) {
+        stack.removeChild(stack.firstElementChild);
+    }
+    resize();
+});
+```
+
+**In `overlay-preload.js`**, expose `onTrim` on the bridge (alongside `onNotif`):
+```js
+onTrim:  (cb) => ipcRenderer.on("notif-trim", (_, max) => cb(max)),
+```
+
+**In `index.tsx`**, add a settings listener in the plugin object's `start()` lifecycle method:
+```tsx
+start() {
+    // Trim overlay cards immediately when maxCards is reduced
+    this._unsubMaxCards = settings.store.addChangeListener?.("maxCards",
+        (val: number) => Native.trimToMaxCards(val)
+    );
+    // Fallback: if addChangeListener is not available, skip — trimming at notification-time is still enforced
+},
+stop() {
+    this._unsubMaxCards?.();
+},
+```
+
+> **Note:** `settings.store.addChangeListener` is the Vencord proxyLazy store API. If this method does not exist at runtime, the immediate-trim behavior degrades gracefully to trim-on-next-notification (which is still enforced by the `while (p.maxCards && stack.children.length >= p.maxCards)` loop in OVERLAY_HTML). Verify after implementation whether the change listener fires — if it does not, remove the dead code.
+
+
 
 ```
 git add src/userplugins/notificationOverlay/index.tsx
@@ -1108,20 +1129,21 @@ function handleNotif(p) { /* existing card logic */ }
 </script>
 ```
 
-4. Replace `window.__bridge.resize(h)` and `window.__bridge.hide()` calls in OVERLAY_HTML with direct `fetch` calls to a tiny local HTTP endpoint — OR — remove them and instead have `native.ts` poll card count from the page every 200ms using:
+4. Replace `window.__bridge.resize(h)` and `window.__bridge.hide()` calls in OVERLAY_HTML with no-ops (delete those calls). Instead, have `native.ts` poll card count from the page every 200ms:
 ```ts
-setInterval(async () => {
-    if (!overlayWin || overlayWin.isDestroyed()) return;
-    const count = await overlayWin.webContents.executeJavaScript(
+const resizeInterval = setInterval(async () => {
+    if (!overlayWin || overlayWin.isDestroyed()) { clearInterval(resizeInterval); return; }
+    const count: number = await overlayWin.webContents.executeJavaScript(
         "document.getElementById('stack').children.length"
     );
     const h = count === 0 ? 0 : count * 100 + (count - 1) * 8 + 16;
     if (count === 0) overlayWin.hide();
-    else overlayWin.setSize(overlayWin.getBounds().width, h);
+    else { overlayWin.showInactive(); overlayWin.setSize(overlayWin.getBounds().width, h); }
 }, 200);
+// Store resizeInterval so you can clearInterval when overlayWin is destroyed.
 ```
 
-5. For the log viewer, similarly replace `win.webContents.send("log-data", entries)` with:
+5. For the log viewer, replace `win.webContents.send("log-data", entries)` with:
 ```ts
 win.webContents.executeJavaScript(`loadLogs(${JSON.stringify(logEntries)})`);
 ```
@@ -1130,7 +1152,7 @@ And `win.webContents.send("log-cleared")` with:
 win.webContents.executeJavaScript("loadLogs([])");
 ```
 
-6. Remove all `ipcMain.on(...)` handlers that are no longer needed (overlay-resize, overlay-hide, log-open-url still needs a solution — use `webContents.setWindowOpenHandler` or add a tiny express server for outbound events). Simplest: keep `contextBridge` just for `openUrl`/`openImage` if partial preload works; otherwise omit image/URL opening entirely and document as known limitation.
+6. For outbound events from the log viewer (openUrl, openImage, clearLog): without a preload, `ipcRenderer` is unavailable. Instead, in `LOG_VIEWER_HTML` replace those `window.__bridge.*` calls with `window.open(url)` for URL/image opening (Electron routes `window.open` through `setWindowOpenHandler`, so add a handler in native.ts to open allowed URLs via `shell.openExternal`), and for clearLog use `executeJavaScript` polling or omit it gracefully (show a "Restart Discord to clear log" tooltip). Remove the `ipcMain.on("log-open-url")`, `ipcMain.on("log-open-image")`, and `ipcMain.on("log-clear")` handlers; add `logWin.webContents.setWindowOpenHandler(({ url }) => { if (ALLOWED_ORIGINS.some(o => url.startsWith(o))) shell.openExternal(url); return { action: "deny" }; })` instead.
 
 7. Re-build and re-verify.
 
