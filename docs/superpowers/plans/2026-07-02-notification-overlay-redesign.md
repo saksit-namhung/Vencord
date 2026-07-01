@@ -296,8 +296,8 @@ function esc(s) {
 function updateClasses() {
     const cards = stack.children;
     for (let i = 0; i < cards.length; i++) {
-        cards[i].classList.toggle("newest", i === 0);
-        cards[i].classList.toggle("old", i >= 2);
+        cards[i].classList.toggle("newest", i === 0);        // index 0: blurple border
+        cards[i].classList.toggle("old",    i >= 2);         // index 2+: opacity 0.75; index 1: no modifier (full opacity, no border)
     }
 }
 
@@ -1109,50 +1109,57 @@ Verify each behavior:
 
 Open Discord's DevTools for the overlay BrowserWindow (from Discord's DevTools → process list). In its console run: `window.__bridge`
 
-**If `window.__bridge` is defined:** preload works. No action needed.
+**If `window.__bridge` is defined:** preload works. No action needed — skip to Step 4.
 
-**If `window.__bridge` is `undefined`:** apply this concrete fallback — remove the preload entirely and drive everything from main via `executeJavaScript`:
+**If `window.__bridge` is `undefined`:** the preload file path did not resolve. Apply the spec-prescribed fallback: inline the bridge via `webContents.executeJavaScript` after `did-finish-load`. Follow these steps exactly:
 
-1. Remove `preload: PRELOAD` and change `sandbox: false` → `sandbox: true` in both BrowserWindow configs.
+- [ ] Remove `preload: PRELOAD` from both BrowserWindow `webPreferences` blocks. Keep `sandbox: false` and `nodeIntegration: false` unchanged.
 
-2. In `native.ts`, replace the `webContents.send("notif-show", p)` call with:
+- [ ] In `OVERLAY_HTML`, replace the `window.__bridge.*` setup block with plain global functions. Rename all `window.__bridge.onNotif(cb)` → expose a global `handleNotif(p)` function; remove `window.__bridge.resize(h)` and `window.__bridge.hide()` calls from the card JS (main will poll for these — see below):
+```html
+<script>
+function handleNotif(p) { /* existing card-add logic unchanged */ }
+// resize() and hide() are called internally; main polls card count — no bridge call needed
+</script>
+```
+
+- [ ] In `native.ts`, replace `win.webContents.send("notif-show", notifMsg)` with:
 ```ts
 win.webContents.executeJavaScript(`handleNotif(${JSON.stringify(notifMsg)})`);
 ```
 
-3. In `OVERLAY_HTML`, rename the `window.__bridge.onNotif(...)` setup to a plain global function:
-```html
-<script>
-function handleNotif(p) { /* existing card logic */ }
-</script>
-```
-
-4. Replace `window.__bridge.resize(h)` and `window.__bridge.hide()` calls in OVERLAY_HTML with no-ops (delete those calls). Instead, have `native.ts` poll card count from the page every 200ms:
+- [ ] In `native.ts`, replace `win.webContents.send("notif-trim", clamped)` with:
 ```ts
-const resizeInterval = setInterval(async () => {
-    if (!overlayWin || overlayWin.isDestroyed()) { clearInterval(resizeInterval); return; }
-    const count: number = await overlayWin.webContents.executeJavaScript(
-        "document.getElementById('stack').children.length"
-    );
-    const h = count === 0 ? 0 : count * 100 + (count - 1) * 8 + 16;
-    if (count === 0) overlayWin.hide();
-    else { overlayWin.showInactive(); overlayWin.setSize(overlayWin.getBounds().width, h); }
-}, 200);
-// Store resizeInterval so you can clearInterval when overlayWin is destroyed.
+win.webContents.executeJavaScript(`
+    while (document.getElementById('stack').children.length > ${clamped})
+        document.getElementById('stack').removeChild(document.getElementById('stack').lastElementChild);
+`);
 ```
 
-5. For the log viewer, replace `win.webContents.send("log-data", entries)` with:
+- [ ] For resize/hide (previously driven by the renderer bridge): remove the `ipcMain.on("overlay-resize")` and `ipcMain.on("overlay-hide")` handlers and add a polling interval in `ensureOverlay` after `did-finish-load`:
 ```ts
-win.webContents.executeJavaScript(`loadLogs(${JSON.stringify(logEntries)})`);
-```
-And `win.webContents.send("log-cleared")` with:
-```ts
-win.webContents.executeJavaScript("loadLogs([])");
+overlayWin.webContents.on("did-finish-load", () => {
+    overlayReady = true;
+    for (const p of pendingNotifs) {
+        overlayWin!.webContents.executeJavaScript(`handleNotif(${JSON.stringify(p)})`);
+    }
+    pendingNotifs = [];
+
+    const poll = setInterval(async () => {
+        if (!overlayWin || overlayWin.isDestroyed()) { clearInterval(poll); return; }
+        const count: number = await overlayWin.webContents.executeJavaScript(
+            "document.getElementById('stack').children.length"
+        );
+        const h = count === 0 ? 0 : count * 100 + (count - 1) * 8 + 16;
+        if (count === 0) overlayWin.hide();
+        else { overlayWin.showInactive(); overlayWin.setSize(overlayWin.getBounds().width, h); }
+    }, 200);
+});
 ```
 
-6. For outbound events from the log viewer (openUrl, openImage, clearLog): without a preload, `ipcRenderer` is unavailable. Instead, in `LOG_VIEWER_HTML` replace those `window.__bridge.*` calls with `window.open(url)` for URL/image opening (Electron routes `window.open` through `setWindowOpenHandler`, so add a handler in native.ts to open allowed URLs via `shell.openExternal`), and for clearLog use `executeJavaScript` polling or omit it gracefully (show a "Restart Discord to clear log" tooltip). Remove the `ipcMain.on("log-open-url")`, `ipcMain.on("log-open-image")`, and `ipcMain.on("log-clear")` handlers; add `logWin.webContents.setWindowOpenHandler(({ url }) => { if (ALLOWED_ORIGINS.some(o => url.startsWith(o))) shell.openExternal(url); return { action: "deny" }; })` instead.
+- [ ] In `LOG_VIEWER_HTML`, replace the `window.__bridge.*` setup with plain global functions. For outbound events (openUrl, openImage, clearLog), expose them as `window.__pendingAction` flags that main polls, OR use the same `executeJavaScript`-from-main pattern. Concrete approach: add a polling interval in `openLogViewer` after log viewer `did-finish-load` that runs `executeJavaScript("window.__pendingAction")` every 300ms, checks for `{ type: "open-url", url }` / `{ type: "open-image", url }` / `{ type: "clear-log" }`, handles each (shell.openExternal for allowed URLs; clearLog + executeJavaScript("loadLogs([])") for clear), then resets the flag via `executeJavaScript("window.__pendingAction = null")`. In LOG_VIEWER_HTML, replace all `window.__bridge.openUrl(url)` calls with `window.__pendingAction = { type: "open-url", url }` etc.
 
-7. Re-build and re-verify.
+- [ ] Re-build and re-verify that the overlay and log viewer work without a preload file.
 
 **Log storage edge cases:**
 - [ ] Manually corrupt `vencord-notification-log.json` (write `"not json"` to it), restart Discord — verify the log viewer opens with an empty feed (no crash)
