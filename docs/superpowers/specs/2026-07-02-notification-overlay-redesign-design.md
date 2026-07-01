@@ -18,15 +18,31 @@ Upgrade the existing `NotificationOverlay` Vencord plugin with three major impro
 
 ## Files
 
-The plugin already has `index.tsx` and `native.ts`. Both are **rewritten** as part of this redesign. Two new files are added:
+The plugin already has `index.tsx` and `native.ts`. Both are **rewritten** as part of this redesign. Three new files are added:
 
 ```
 src/userplugins/notificationOverlay/
 ├── index.tsx            — REWRITE: renderer flux listeners, settings, IPC bridge calls
 ├── native.ts            — REWRITE: overlay window, log file I/O, IPC handlers
-├── overlay.html         — NEW: persistent overlay page; cards added/removed via IPC
-├── overlay-preload.js   — NEW: contextBridge preload for overlay window
-└── logViewer.html       — NEW: standalone log website; populated via executeJavaScript
+├── overlay-preload.js   — NEW: contextBridge preload for overlay window (plain JS, no bundling)
+└── native.ts            (logViewer HTML embedded as template literal — see below)
+```
+
+### Asset Strategy
+
+Vencord's build system compiles TypeScript but does not automatically copy arbitrary asset files. To avoid a custom build step:
+
+- **`overlay.html`** — embedded as a template literal constant `OVERLAY_HTML` inside `native.ts`. Loaded via `win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(OVERLAY_HTML))`.
+- **`logViewer.html`** — embedded as a template literal constant `LOG_VIEWER_HTML` inside `native.ts`. Loaded the same way.
+- **`overlay-preload.js`** — a plain `.js` file (no TypeScript compilation needed) placed alongside `native.ts`. Referenced via `path.join(__dirname, "overlay-preload.js")` in `webPreferences.preload`. Vencord copies non-TS files in userplugin directories to the build output.
+
+Final file list:
+
+```
+src/userplugins/notificationOverlay/
+├── index.tsx            — REWRITE
+├── native.ts            — REWRITE (contains OVERLAY_HTML and LOG_VIEWER_HTML as constants)
+└── overlay-preload.js   — NEW
 ```
 
 ---
@@ -81,7 +97,7 @@ When the `cardWidth` setting changes, the new value takes effect on the **next n
 
 ### IPC Message: `notif-show`
 
-Sent from `native.ts` → `overlay.html` via `webContents.executeJavaScript`:
+Sent from `native.ts` → overlay window via **`win.webContents.send("notif-show", payload)`** (Electron IPC — not `executeJavaScript`). The preload exposes `ipcRenderer.on("notif-show", ...)` to the page via contextBridge.
 
 ```ts
 interface NotifPayload {
@@ -108,7 +124,15 @@ interface NotifPayload {
 
 ## Card Design (Compact+)
 
-**Dimensions:** `cardWidth` px wide (default 420) × ~100px tall per card, 8px gap between cards
+**Dimensions:** `cardWidth` px wide (default 420) × 100px tall per card, 8px gap between cards
+
+**Height constants:**
+```
+CARD_HEIGHT = 100   // px, fixed per card
+CARD_GAP    = 8     // px between cards
+PADDING     = 16    // px — window top/bottom inset
+windowHeight = (cardCount * (CARD_HEIGHT + CARD_GAP)) - CARD_GAP + PADDING
+```
 
 **Layout:**
 ```
@@ -195,12 +219,30 @@ A notification is shown only when **all** of the following are true:
 | Channel exists | `ChannelStore.getChannel(message.channel_id)` is non-null |
 | Setting enabled | DM/Group DM → `dmNotifications`; server channel → `serverNotifications` |
 
-### CALL_UPDATE
+### CALL_UPDATE — Call Deduplication
 
-A call notification is shown only when:
-- `call.ringing` array includes the current user's ID
-- `settings.store.callNotifications` is true
-- Deduplication: a call notification for the same `channel_id` is not shown again until the call stops ringing (tracked via a `Set<string>` of active ringing channel IDs in `native.ts`, cleared on next `CALL_UPDATE` where the channel is no longer ringing)
+Ringing state is tracked entirely in **`index.tsx`** (where `CALL_UPDATE` is handled), not in `native.ts`:
+
+```ts
+const ringingChannels = new Set<string>();
+
+flux: {
+  CALL_UPDATE({ call }) {
+    const channelId: string = call.channel_id;
+    const isRinging: boolean = call?.ringing?.includes(currentUserId);
+
+    if (isRinging && !ringingChannels.has(channelId)) {
+      ringingChannels.add(channelId);
+      Native.showNotification(/* call payload */);
+    }
+    if (!isRinging) {
+      ringingChannels.delete(channelId); // call ended or answered — reset for future
+    }
+  }
+}
+```
+
+`native.ts` receives a plain `showNotification` call and has no knowledge of call state.
 
 ---
 
@@ -245,23 +287,25 @@ contextBridge.exposeInMainWorld("__bridge", {
 | `overlay-hide` | overlay → main | — | `win.hide()` |
 | `log-clear` | logViewer → main | — | Wipe JSON, send `log-cleared` |
 | `log-cleared` | main → logViewer | — | Viewer clears feed in-place |
-| `log-open-url` | logViewer → main | `{ url: string }` | `shell.openExternal(url)` |
+| `log-open-url` | logViewer → main | `{ url: string }` | Main validates URL (must start with `discord://-/channels/`), then calls `shell.openExternal(url)`. URLs failing validation are silently ignored. |
 
 All external URLs (Discord deep links, image thumbnails) are opened via `shell.openExternal` in main — never `window.open` in the renderer.
 
 ---
 
-## Log Viewer Website (`logViewer.html`)
+## Log Viewer Website
+
+### Access
 
 Button in Vencord plugin settings panel: **"📋 View Notification Log"**
-Calls `Native.openLogViewer()` → opens a new `BrowserWindow` (1000×700px, framed, not always-on-top).
+
+In `index.tsx`, implemented as a setting of type `OptionType.COMPONENT` rendering a `<Button>` that calls `Native.openLogViewer()`. This is the standard Vencord pattern for action buttons in plugin settings.
+
+`Native.openLogViewer()` → opens a new `BrowserWindow` (1000×700px, framed, not always-on-top). If a viewer window is already open and not destroyed, it is focused instead of opening a second one.
 
 ### Population
 
-`native.ts` reads the JSON file and calls:
-```js
-webContents.executeJavaScript(`loadLogs(${JSON.stringify(entries)})`)
-```
+`native.ts` reads the JSON file and populates the viewer via **`win.webContents.send("log-data", entries)`** (Electron IPC). The `logViewer.html` preload (reuses `overlay-preload.js` bridge pattern, or inline `<script>` using `window.__bridge`) calls `ipcRenderer.on("log-data", (_, entries) => loadLogs(entries))`.
 
 The viewer shows a **snapshot** of the log at the time it was opened. It does not live-update as new notifications arrive.
 
@@ -271,7 +315,7 @@ The viewer shows a **snapshot** of the log at the time it was opened. It does no
 |---|---|---|---|
 | `log-clear` | renderer → main | — | Wipes JSON file to `[]`; main sends `log-cleared` back |
 | `log-cleared` | main → renderer | — | Viewer re-renders with empty feed and shows "No notifications yet" state |
-| `log-open-url` | renderer → main | `{ url: string }` | Main calls `shell.openExternal(url)` to open Discord deep link |
+| `log-open-url` | renderer → main | `{ url: string }` | Main validates URL (must start with `discord://-/channels/`), then calls `shell.openExternal(url)`. URLs failing validation are silently ignored. |
 
 **Clear Log flow:** User clicks "🗑 Clear Log" → renderer sends `log-clear` → main wipes file → main sends `log-cleared` → viewer clears feed in-place (no window close/reopen).
 
