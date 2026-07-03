@@ -1,12 +1,13 @@
 ﻿/*
  * NotificationOverlay — native.ts
  * Runs in Electron main process.
- * Responsibilities: overlay window, log viewer window, JSON log I/O.
+ * Responsibilities: overlay window, JSON log I/O, log viewer HTML generation.
  */
 
 import { app, BrowserWindow, ipcMain, screen, shell } from "electron";
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
+import { pathToFileURL } from "url";
 
 // ─── Debug logger ─────────────────────────────────────────────────────────────
 
@@ -138,41 +139,53 @@ html, body { width: 100%; background: transparent; overflow: hidden; }
     background: rgba(15, 15, 18, 0.96);
     border: 1px solid rgba(255,255,255,0.10);
     border-radius: 10px;
-    padding: 12px 14px;
+    padding: 10px 14px;
     display: flex;
     gap: 10px;
-    align-items: flex-start;
+    align-items: stretch;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     color: #fff;
     height: 100px;
     overflow: hidden;
     flex-shrink: 0;
+    box-sizing: border-box;
 }
 .card.newest { border-color: rgba(88,101,242,0.5); }
 .card.old { opacity: 0.75; }
 .avatar {
-    width: 40px; height: 40px;
+    width: 44px; height: 44px;
     border-radius: 50%;
     object-fit: cover;
     flex-shrink: 0;
     border: 2px solid rgba(88,101,242,0.6);
+    align-self: center;
 }
 .avatar-fallback {
-    width: 40px; height: 40px;
+    width: 44px; height: 44px;
     border-radius: 50%;
     background: #5865f2;
     display: flex; align-items: center; justify-content: center;
-    font-size: 18px; flex-shrink: 0;
+    font-size: 20px; flex-shrink: 0;
+    align-self: center;
 }
-.txt { flex: 1; min-width: 0; overflow: hidden; }
+.txt {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+    overflow: hidden;
+}
 .title {
     font-size: 13px; font-weight: 700; color: #fff;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    line-height: 1.3;
 }
 .server {
     font-size: 11px; color: #7289da;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    margin-bottom: 4px;
+    line-height: 1.3;
 }
 .body {
     font-size: 12px; color: rgba(255,255,255,0.82);
@@ -181,6 +194,7 @@ html, body { width: 100%; background: transparent; overflow: hidden; }
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
+    margin-top: 4px;
 }
 </style>
 </head>
@@ -262,9 +276,17 @@ __bridge.onTrim(function(max) {
 </body>
 </html>`;
 
-// ─── Log Viewer HTML ──────────────────────────────────────────────────────────
+// ─── Log Viewer HTML ─────────────────────────────────────────────────────────
 
-const LOG_VIEWER_HTML = `<!DOCTYPE html>
+function safeJson(data: any): string {
+    return JSON.stringify(data)
+        .replace(/<\/script>/gi, "<\\/script>")  // prevent script-tag injection
+        .replace(/\u2028/g, "\\u2028")           // U+2028 LINE SEPARATOR — not valid in JS string literals
+        .replace(/\u2029/g, "\\u2029");          // U+2029 PARAGRAPH SEPARATOR — same
+}
+
+function buildLogViewerHtml(entries: LogEntry[]): string {
+    return `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -272,30 +294,17 @@ const LOG_VIEWER_HTML = `<!DOCTYPE html>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #1e1e2e; color: #cdd6f4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; min-height: 100vh; }
-
-/* Top bar */
 .topbar { background: #181825; border-bottom: 1px solid rgba(255,255,255,0.08); padding: 14px 24px; display: flex; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 10; }
 .topbar-title { font-size: 18px; font-weight: 700; color: #fff; }
 .topbar-count { font-size: 12px; color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.08); padding: 2px 10px; border-radius: 20px; }
-.topbar-spacer { flex: 1; }
-.clear-btn { font-size: 12px; color: #ed4245; background: rgba(237,66,69,0.12); border: 1px solid rgba(237,66,69,0.3); padding: 6px 14px; border-radius: 6px; cursor: pointer; }
-.clear-btn:hover { background: rgba(237,66,69,0.25); }
-
-/* Filter tabs */
 .filters { padding: 12px 24px; display: flex; gap: 8px; background: #1e1e2e; border-bottom: 1px solid rgba(255,255,255,0.06); }
 .filter { font-size: 12px; padding: 5px 14px; border-radius: 20px; cursor: pointer; border: 1px solid rgba(255,255,255,0.12); color: rgba(255,255,255,0.6); background: transparent; }
 .filter.active { background: #5865f2; border-color: #5865f2; color: #fff; font-weight: 600; }
-
-/* Feed */
 .feed { max-width: 780px; margin: 0 auto; padding: 20px 24px; }
 .empty { text-align: center; color: rgba(255,255,255,0.3); padding: 60px 0; font-size: 14px; }
-
-/* Day divider */
 .day-divider { text-align: center; font-size: 11px; color: rgba(255,255,255,0.3); text-transform: uppercase; letter-spacing: 1px; padding: 12px 0 4px; position: relative; }
 .day-divider::before { content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: rgba(255,255,255,0.07); }
 .day-divider span { background: #1e1e2e; padding: 0 12px; position: relative; }
-
-/* Entry */
 .entry { display: flex; gap: 14px; padding: 16px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
 .entry:last-child { border-bottom: none; }
 .avatar { width: 46px; height: 46px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 20px; border: 2px solid rgba(255,255,255,0.1); object-fit: cover; }
@@ -304,17 +313,17 @@ body { background: #1e1e2e; color: #cdd6f4; font-family: -apple-system, BlinkMac
 .entry-name { font-size: 14px; font-weight: 700; color: #fff; }
 .badge { font-size: 10px; padding: 2px 7px; border-radius: 10px; font-weight: 600; }
 .badge-server { background: rgba(88,101,242,0.25); color: #7289da; }
-.badge-dm     { background: rgba(59,165,93,0.2);   color: #3ba55d; }
-.badge-call   { background: rgba(237,66,69,0.2);   color: #ed4245; }
+.badge-dm { background: rgba(59,165,93,0.2); color: #3ba55d; }
+.badge-call { background: rgba(237,66,69,0.2); color: #ed4245; }
 .entry-server { font-size: 12px; color: #7289da; margin-bottom: 6px; }
 .entry-message { font-size: 13px; color: rgba(255,255,255,0.85); line-height: 1.55; word-break: break-word; }
 .entry-images { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
-.entry-images img { max-width: 200px; max-height: 160px; border-radius: 6px; object-fit: cover; border: 1px solid rgba(255,255,255,0.1); cursor: pointer; }
+.entry-images img { max-width: 200px; max-height: 160px; border-radius: 6px; object-fit: cover; border: 1px solid rgba(255,255,255,0.1); }
 .entry-footer { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
 .entry-time { font-size: 11px; color: rgba(255,255,255,0.3); }
-.jump-btn { font-size: 11px; color: #5865f2; background: rgba(88,101,242,0.12); border: 1px solid rgba(88,101,242,0.3); padding: 3px 10px; border-radius: 5px; cursor: pointer; }
+.jump-btn { font-size: 11px; color: #5865f2; background: rgba(88,101,242,0.12); border: 1px solid rgba(88,101,242,0.3); padding: 3px 10px; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; }
 .jump-btn:hover { background: rgba(88,101,242,0.25); }
-.chan-btn { font-size: 11px; color: rgba(255,255,255,0.45); background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); padding: 3px 10px; border-radius: 5px; cursor: pointer; }
+.chan-btn { font-size: 11px; color: rgba(255,255,255,0.45); background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); padding: 3px 10px; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; }
 .chan-btn:hover { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.7); }
 </style>
 </head>
@@ -323,8 +332,6 @@ body { background: #1e1e2e; color: #cdd6f4; font-family: -apple-system, BlinkMac
   <span style="font-size:22px;">💬</span>
   <span class="topbar-title">Notification Log</span>
   <span class="topbar-count" id="count">0 notifications</span>
-  <div class="topbar-spacer"></div>
-  <button class="clear-btn" id="clearBtn">🗑 Clear Log</button>
 </div>
 <div class="filters">
   <button class="filter active" data-filter="all">All</button>
@@ -335,78 +342,69 @@ body { background: #1e1e2e; color: #cdd6f4; font-family: -apple-system, BlinkMac
 <div class="feed" id="feed">
   <div class="empty">No notifications yet.</div>
 </div>
-
 <script>
+var LOG_DATA = ${safeJson(entries)};
+
 function esc(s) {
   return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
-
 function formatDate(ts) {
   return new Date(ts).toLocaleString(undefined, {
-    weekday: "long", day: "numeric", month: "short", year: "numeric",
-    hour: "2-digit", minute: "2-digit"
+    weekday:"long", day:"numeric", month:"short", year:"numeric",
+    hour:"2-digit", minute:"2-digit"
   });
 }
-
 function dayLabel(ts) {
-  const d = new Date(ts), today = new Date();
-  const isToday = d.toDateString() === today.toDateString();
-  if (isToday) return "Today \u2014 " + d.toLocaleDateString(undefined, { weekday:"long", day:"numeric", month:"long", year:"numeric" });
-  const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
-  if (d.toDateString() === yesterday.toDateString()) return "Yesterday \u2014 " + d.toLocaleDateString(undefined, { weekday:"long", day:"numeric", month:"long", year:"numeric" });
-  return d.toLocaleDateString(undefined, { weekday:"long", day:"numeric", month:"long", year:"numeric" });
+  var d = new Date(ts), today = new Date();
+  if (d.toDateString() === today.toDateString())
+    return "Today \u2014 " + d.toLocaleDateString(undefined, {weekday:"long",day:"numeric",month:"long",year:"numeric"});
+  var yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
+  if (d.toDateString() === yesterday.toDateString())
+    return "Yesterday \u2014 " + d.toLocaleDateString(undefined, {weekday:"long",day:"numeric",month:"long",year:"numeric"});
+  return d.toLocaleDateString(undefined, {weekday:"long",day:"numeric",month:"long",year:"numeric"});
 }
 
-function openUrl(url) { __bridge.openUrl(url); }
-
-let allEntries = [];
-let activeFilter = "all";
+var allEntries = [];
+var activeFilter = "all";
 
 function renderEntries(entries) {
-  const feed = document.getElementById("feed");
-  const count = document.getElementById("count");
-
-  const filtered = activeFilter === "all" ? entries : entries.filter(e => e.type === activeFilter);
+  var feed = document.getElementById("feed");
+  var count = document.getElementById("count");
+  var filtered = activeFilter === "all" ? entries : entries.filter(function(e) { return e.type === activeFilter; });
   count.textContent = entries.length + " notification" + (entries.length !== 1 ? "s" : "");
-
-  if (filtered.length === 0) {
-    feed.innerHTML = '<div class="empty">No notifications yet.</div>';
-    return;
-  }
-
-  const sorted = [...filtered].sort((a,b) => b.timestamp - a.timestamp);
-
-  let html = "";
-  let lastDay = "";
-  for (const e of sorted) {
-    const day = dayLabel(e.timestamp);
-    if (day !== lastDay) {
-      html += '<div class="day-divider"><span>' + esc(day) + '</span></div>';
-      lastDay = day;
-    }
-
-    const badge = { server: "Server", dm: "DM", call: "Call" }[e.type] || e.type;
-    const badgeCls = "badge-" + e.type;
-
-    const avatarEl = e.avatarUrl
+  if (filtered.length === 0) { feed.innerHTML = '<div class="empty">No notifications yet.</div>'; return; }
+  var sorted = filtered.slice().sort(function(a,b) { return b.timestamp - a.timestamp; });
+  var html = "";
+  var lastDay = "";
+  for (var i = 0; i < sorted.length; i++) {
+    var e = sorted[i];
+    var day = dayLabel(e.timestamp);
+    if (day !== lastDay) { html += '<div class="day-divider"><span>' + esc(day) + '</span></div>'; lastDay = day; }
+    var badge = ({server:"Server",dm:"DM",call:"Call"})[e.type] || e.type;
+    var badgeCls = "badge-" + e.type;
+    var avatarEl = e.avatarUrl
       ? '<img class="avatar" src="' + esc(e.avatarUrl) + '" onerror="this.outerHTML=\'<div class=\\"avatar\\" style=\\"background:#5865f2;font-size:20px;\\">&#x1F4AC;</div>\'">'
       : '<div class="avatar" style="background:' + (e.type==="call"?"#ed4245":e.type==="dm"?"#3ba55d":"#5865f2") + ';font-size:20px;">' + (e.type==="call"?"&#x1F4DE;":e.type==="dm"?"&#x2709;&#xFE0F;":"&#x1F4AC;") + '</div>';
-
-    const imagesHtml = (e.imageUrls && e.imageUrls.length)
-      ? '<div class="entry-images">' + e.imageUrls.map(function(u){ return '<img src="' + esc(u) + '" onerror="this.style.display=\'none\'" onclick="__bridge.openImage(\'' + esc(u) + '\')">'; }).join("") + '</div>'
+    var imagesHtml = (e.imageUrls && e.imageUrls.length)
+      ? '<div class="entry-images">' + e.imageUrls.map(function(u) {
+          return '<a href="' + esc(u) + '" target="_blank" rel="noopener noreferrer"><img src="' + esc(u) + '" onerror="this.style.display=\'none\'"></a>';
+        }).join("") + '</div>'
       : "";
-
-    const jumpUrl = e.messageId
-      ? 'discord://-/channels/' + (e.guildId || "@me") + '/' + e.channelId + '/' + e.messageId
-      : null;
-    const chanUrl = 'discord://-/channels/' + (e.guildId || "@me") + '/' + e.channelId;
-    const chanLabel = { server: "# Open Channel", dm: "\u2709\uFE0F Open DM", call: "\uD83D\uDD0A Open Channel" }[e.type] || "Open";
-
-    const jumpBtn = jumpUrl
-      ? '<button class="jump-btn" onclick="openUrl(\'' + esc(jumpUrl) + '\')">\u2197 Jump to Message</button>'
-      : "";
-
-    html += '<div class="entry">' + avatarEl + '<div class="entry-body"><div class="entry-header"><span class="entry-name">' + esc(e.title) + '</span><span class="badge ' + badgeCls + '">' + badge + '</span></div><div class="entry-server">' + esc(e.serverLine) + '</div><div class="entry-message">' + esc(e.body) + '</div>' + imagesHtml + '<div class="entry-footer"><span class="entry-time">' + esc(formatDate(e.timestamp)) + '</span>' + jumpBtn + '<button class="chan-btn" onclick="openUrl(\'' + esc(chanUrl) + '\')">' + chanLabel + '</button></div></div></div>';
+    var jumpUrl = e.messageId ? 'discord://-/channels/' + (e.guildId || "@me") + '/' + e.channelId + '/' + e.messageId : null;
+    var chanUrl = 'discord://-/channels/' + (e.guildId || "@me") + '/' + e.channelId;
+    var chanLabel = ({server:"# Open Channel",dm:"\u2709\uFE0F Open DM",call:"\uD83D\uDD0A Open Channel"})[e.type] || "Open";
+    var jumpBtn = jumpUrl ? '<a class="jump-btn" href="' + esc(jumpUrl) + '">\u2197 Jump to Message</a>' : "";
+    html += '<div class="entry">' + avatarEl +
+      '<div class="entry-body">' +
+        '<div class="entry-header"><span class="entry-name">' + esc(e.title) + '</span><span class="badge ' + badgeCls + '">' + badge + '</span></div>' +
+        '<div class="entry-server">' + esc(e.serverLine) + '</div>' +
+        '<div class="entry-message">' + esc(e.body) + '</div>' +
+        imagesHtml +
+        '<div class="entry-footer"><span class="entry-time">' + esc(formatDate(e.timestamp)) + '</span>' +
+          jumpBtn +
+          '<a class="chan-btn" href="' + esc(chanUrl) + '">' + chanLabel + '</a>' +
+        '</div>' +
+      '</div></div>';
   }
   feed.innerHTML = html;
 }
@@ -425,27 +423,19 @@ document.querySelectorAll(".filter").forEach(function(btn) {
   });
 });
 
-document.getElementById("clearBtn").addEventListener("click", function() {
-  __bridge.clearLog();
-});
-
-__bridge.onLogData(loadLogs);
-__bridge.onLogCleared(function() {
-  allEntries = [];
-  renderEntries([]);
-});
+document.addEventListener("DOMContentLoaded", function() { loadLogs(LOG_DATA); });
 </script>
 </body>
 </html>`;
+}
 
-// Write HTML templates to disk so loadFile() works (data: URLs block preload scripts)
+// Write overlay HTML to disk so loadFile() works (data: URLs block preload scripts)
 const PRELOAD = join(__dirname, "overlay-preload.js");
 try {
     writeFileSync(OVERLAY_HTML_FILE, OVERLAY_HTML, "utf-8");
-    writeFileSync(LOG_VIEWER_HTML_FILE, LOG_VIEWER_HTML, "utf-8");
-    log("HTML templates written to userData, PRELOAD =", PRELOAD);
+    log("Overlay HTML written to userData, PRELOAD =", PRELOAD);
 } catch (e) {
-    warn("Failed to write HTML templates —", e);
+    warn("Failed to write overlay HTML —", e);
 }
 
 // ─── Overlay Window ───────────────────────────────────────────────────────────
@@ -547,41 +537,6 @@ ipcMain.on("overlay-hide", (event) => {
     win.hide();
 });
 
-// ─── Log Viewer Window ────────────────────────────────────────────────────────
-
-let logViewerWin: BrowserWindow | null = null;
-
-function sendLogData(win: BrowserWindow): void {
-    win.webContents.once("did-finish-load", () => {
-        win.webContents.send("log-data", logEntries);
-    });
-}
-
-// IPC: log viewer → main
-ipcMain.on("log-clear", (event) => {
-    clearLog();
-    const win = BrowserWindow.fromWebContents(event.sender);
-    if (win && !win.isDestroyed()) win.webContents.send("log-cleared");
-});
-
-ipcMain.on("log-open-url", (_event, { url }: { url: string }) => {
-    if (typeof url === "string" && url.startsWith("discord://-/channels/")) {
-        shell.openExternal(url);
-    }
-    // invalid URLs silently ignored
-});
-
-ipcMain.on("log-open-image", (_event, { url }: { url: string }) => {
-    // Allow CDN image URLs only (Discord attachments and avatars)
-    if (typeof url === "string" && (
-        url.startsWith("https://cdn.discordapp.com/") ||
-        url.startsWith("https://media.discordapp.net/")
-    )) {
-        shell.openExternal(url);
-    }
-    // non-CDN URLs silently ignored
-});
-
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
 export function showNotification(_: any, payload: NotifPayload & {
@@ -637,35 +592,27 @@ export function trimToMaxCards(_: any, max: number): void {
 }
 
 export function openLogViewer(_: any): void {
-    if (logViewerWin && !logViewerWin.isDestroyed()) {
-        log("openLogViewer: focusing existing window");
-        logViewerWin.focus();
+    log("openLogViewer: building HTML snapshot with", logEntries.length, "entries");
+    let html: string;
+    try {
+        html = buildLogViewerHtml(logEntries);
+    } catch (e) {
+        warn("openLogViewer: buildLogViewerHtml failed —", e);
         return;
     }
+    try {
+        writeFileSync(LOG_VIEWER_HTML_FILE, html, "utf-8");
+        log("openLogViewer: wrote snapshot to", LOG_VIEWER_HTML_FILE);
+    } catch (e) {
+        warn("openLogViewer: failed to write HTML file —", e);
+        return;
+    }
+    const url = pathToFileURL(LOG_VIEWER_HTML_FILE).href;
+    log("openLogViewer: opening", url);
+    shell.openExternal(url).catch(e => warn("openLogViewer: shell.openExternal failed —", e));
+}
 
-    log("openLogViewer: creating log viewer window, logEntries =", logEntries.length);
-    // NOTE: Do NOT pass `title` here. Vencord's patcher.ts intercepts BrowserWindow
-    // construction and replaces the preload with its own preload.js whenever BOTH
-    // `options.title` and `options.webPreferences.preload` are present. Omitting the
-    // title makes the patcher skip this window, preserving our overlay-preload.js.
-    logViewerWin = new BrowserWindow({
-        width: 1000,
-        height: 700,
-        alwaysOnTop: false,
-        webPreferences: {
-            nodeIntegration: false,
-            contextIsolation: true,
-            sandbox: false,
-            preload: PRELOAD,
-        },
-    });
-    logViewerWin.setTitle("Notification Log");
-
-    logViewerWin.loadFile(LOG_VIEWER_HTML_FILE);
-    log("openLogViewer: loadFile called");
-    sendLogData(logViewerWin);
-    logViewerWin.on("closed", () => {
-        log("openLogViewer: log viewer window closed");
-        logViewerWin = null;
-    });
+export function clearNotificationLog(_: any): void {
+    log("clearNotificationLog: clearing log");
+    clearLog();
 }
