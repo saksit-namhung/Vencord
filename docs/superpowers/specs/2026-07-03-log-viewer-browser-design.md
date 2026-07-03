@@ -40,7 +40,13 @@ Additionally, the user prefers the log to open in the system browser rather than
 
 Replaces the static `LOG_VIEWER_HTML` template. Differences from the current template:
 
-- **Data embedding:** `var LOG_DATA = ${JSON.stringify(entries)};` at the top of the inline `<script>` block.
+- **Data embedding:** `var LOG_DATA = ${safeJson(entries)};` at the top of the inline `<script>` block, where `safeJson` is:
+  ```ts
+  JSON.stringify(entries)
+    .replace(/<\/script>/gi, "<\\/script>")   // prevent script-tag injection
+    .replace(/\u2028/g, "\\u2028")            // U+2028 LINE SEPARATOR — invalid in JS string literals
+    .replace(/\u2029/g, "\\u2029");           // U+2029 PARAGRAPH SEPARATOR — same
+  ```
 - **Initialisation:** `document.addEventListener("DOMContentLoaded", () => loadLogs(LOG_DATA));` — no IPC, no `__bridge`.
 - **Clear button removed** from the top bar.
 - **`discord://` links** rendered as `<a href="discord://..." >` — the OS/browser dispatches the protocol to Discord.
@@ -52,12 +58,16 @@ Replaces the static `LOG_VIEWER_HTML` template. Differences from the current tem
 ```
 1. html = buildLogViewerHtml(logEntries)
 2. writeFileSync(LOG_VIEWER_HTML_FILE, html, "utf-8")   // overwrite — always fresh snapshot
-3. url = "file:///" + LOG_VIEWER_HTML_FILE.replace(/\\/g, "/")
-4. shell.openExternal(url)
+3. url = pathToFileURL(LOG_VIEWER_HTML_FILE).href
+        (Node's url.pathToFileURL handles Windows drive letters, backslashes, spaces, non-ASCII)
+4. shell.openExternal(url).catch(e => warn("openLogViewer: shell.openExternal failed —", e))
 ```
 
-- Each button click produces a fresh snapshot and opens a new browser tab.
-- If `writeFileSync` throws: log the error, return silently.
+- Each button click writes a new HTML file and calls `shell.openExternal`, which opens a new browser tab (or window, depending on browser settings — both are acceptable).
+- The shared `LOG_VIEWER_HTML_FILE` path is overwritten on each open. Tabs that are **already loaded** are unaffected: they hold an in-memory copy of the HTML they originally loaded; overwriting the file on disk does not change them. If the user manually refreshes a stale tab, they will see the current state of the file.
+- `pathToFileURL` from Node's built-in `url` module is used for correct cross-platform file URL construction (handles Windows drive letters, backslashes, spaces, and non-ASCII characters in the `userData` path).
+- If `writeFileSync` throws: log the error and return — browser is not opened. The on-disk file may be left in an inconsistent state; the next successful open will overwrite it.
+- `shell.openExternal` returns a Promise; rejection is caught and logged as a warning. No user-visible error is shown (consistent with `discord://` deep-link failure handling elsewhere in the plugin).
 - `logViewerWin` state variable and `sendLogData()` helper are removed entirely.
 
 ### `clearNotificationLog(_: any): void` (new export)
@@ -67,6 +77,8 @@ export function clearNotificationLog(_: any): void {
     clearLog(); // wipes logEntries + writes [] to JSON file
 }
 ```
+
+Clearing the log does **not** affect any already-open browser tabs — those tabs hold an in-memory copy of the HTML and are not aware that the source file has changed. Open tabs become stale immediately after a clear; they remain readable as a historical snapshot until the user closes or refreshes them. The next click of "📋 View Notification Log" will open a fresh snapshot reflecting the cleared (empty) state.
 
 ### Plugin Settings (`index.tsx`)
 
@@ -93,7 +105,18 @@ clearLog: {
 
 No confirmation dialog — consistent with the original spec.
 
-### `overlay-preload.js` cleanup
+### URL / data trust boundary
+
+All data embedded in the generated HTML originates from `logEntries`, which are written by `appendLog()` in `native.ts` (main process) — not from untrusted renderer input. Fields that appear in URLs (`channelId`, `guildId`, `messageId`, `avatarUrl`, `imageUrls`) are stored verbatim from Discord's own event payloads.
+
+- **`discord://` deep links**: `channelId`, `guildId`, `messageId` are Discord snowflakes (numeric strings). They are HTML-escaped by the `esc()` function inside `buildLogViewerHtml` before being rendered into `href` attributes. Clicking these links dispatches a protocol-handler open to the OS — no HTTP fetch occurs. No additional validation needed beyond HTML-escaping.
+- **`avatarUrl` / `imageUrls`**: Discord CDN URLs (`cdn.discordapp.com` / `media.discordapp.net`). They are HTML-escaped before rendering into `src` and `href` attributes. Clicking image links opens a new browser tab to the CDN URL — a standard browser navigation, not a fetch from a `file://` origin. The main-process CDN allowlist (`log-open-image`) is intentionally removed; no cross-origin fetching is performed from the `file://` page itself.
+
+No raw `innerHTML` injection of unescaped user-controlled strings. The `safeJson` escaping (plus `esc()` HTML-escaping inside `buildLogViewerHtml`) forms the complete trust boundary for injected content.
+
+### Viewer UI behaviour
+
+All existing log viewer UI features are preserved unchanged: filter tabs (All / Servers / DMs / Calls), day-group dividers, entry layout (avatar, name, badge, server line, message body, images, footer), and "↗ Jump to Message" / channel-open buttons. The only removal is the "🗑 Clear Log" button from the top bar.
 
 Remove channels that were only used by the log viewer window (now a browser page):
 
@@ -118,7 +141,7 @@ Keep all overlay channels (`onNotif`, `onTrim`, `resize`, `hide`).
 |---|---|
 | `log-clear` | Browser page cannot send IPC; clear moved to plugin settings |
 | `log-open-url` | Browser handles `discord://` protocol natively |
-| `log-open-image` | Browser opens URLs with `target="_blank"` |
+| `log-open-image` | Removed along with main-process CDN URL allowlist (intentional). Images are now direct `<a href target="_blank">` links; the browser's own security model applies. Only Discord CDN avatar and attachment URLs are stored in the log, so risk is low. |
 
 ### Handlers unchanged
 
@@ -130,9 +153,10 @@ All overlay IPC handlers (`overlay-resize`, `overlay-hide`) are unaffected.
 
 | Case | Behaviour |
 |---|---|
-| `writeFileSync` fails | Log warning, return — browser not opened |
-| `logEntries` empty | Valid state — `buildLogViewerHtml([])` renders "No notifications yet." empty state |
-| Browser not available | `shell.openExternal` is a no-op / logs system error; no crash |
+| `writeFileSync` fails in `openLogViewer` | Log warning, return — browser not opened; on-disk file may be stale |
+| `shell.openExternal` rejects | Catch and log warning; no user-visible error |
+| `logEntries` empty | Valid state — `buildLogViewerHtml([])` renders the "No notifications yet." empty state |
+| `writeFileSync` fails in `clearNotificationLog` | `clearLog()` catches the write error and logs a warning; `logEntries` is wiped in memory regardless, so the in-memory state is cleared even if the file write failed. The file will be corrected on the next successful `saveLog()` call (e.g. when the next notification arrives). |
 
 ---
 
