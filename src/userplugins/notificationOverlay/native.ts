@@ -442,7 +442,10 @@ document.getElementById("feed").addEventListener("click", function(e) {
       var href = el.getAttribute("href");
       if (href && href.indexOf("discord://") === 0) {
         e.preventDefault();
-        window.open(href);
+        // window.open() opens a popup which Chrome/Edge may block from file:// origins.
+        // location.href navigates the current tab to discord:// — Chrome intercepts it,
+        // triggers the registered Discord handler, and keeps the tab at the file:// URL.
+        window.location.href = href;
       }
       return;
     }
