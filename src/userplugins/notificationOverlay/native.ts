@@ -431,6 +431,24 @@ document.querySelectorAll(".filter").forEach(function(btn) {
 });
 
 document.addEventListener("DOMContentLoaded", function() { loadLogs(LOG_DATA); });
+
+// Intercept discord:// link clicks via event delegation.
+// window.open() in a click handler (user gesture) reliably triggers the
+// Discord protocol handler without navigating the log viewer page away.
+document.getElementById("feed").addEventListener("click", function(e) {
+  var el = e.target;
+  while (el && el !== this) {
+    if (el.tagName === "A") {
+      var href = el.getAttribute("href");
+      if (href && href.indexOf("discord://") === 0) {
+        e.preventDefault();
+        window.open(href);
+      }
+      return;
+    }
+    el = el.parentElement;
+  }
+});
 </script>
 </body>
 </html>`;
