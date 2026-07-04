@@ -32,9 +32,10 @@ const CARD_HEIGHT = 100;  // px per card
 const CARD_GAP    = 8;    // px gap between cards
 const PADDING     = 16;   // px top+bottom window inset
 const LOG_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days in ms
-const LOG_FILE        = join(app.getPath("userData"), "vencord-notification-log.json");
+const LOG_FILE              = join(app.getPath("userData"), "vencord-notification-log.json");
 const OVERLAY_HTML_FILE     = join(app.getPath("userData"), "vencord-notif-overlay.html");
 const LOG_VIEWER_HTML_FILE  = join(app.getPath("userData"), "vencord-notif-logviewer.html");
+const LOG_VIEWER_PRELOAD_FILE = join(app.getPath("userData"), "vencord-notif-logviewer-preload.js");
 
 log("LOG_FILE =", LOG_FILE);
 
@@ -321,9 +322,9 @@ body { background: #1e1e2e; color: #cdd6f4; font-family: -apple-system, BlinkMac
 .entry-images img { max-width: 200px; max-height: 160px; border-radius: 6px; object-fit: cover; border: 1px solid rgba(255,255,255,0.1); }
 .entry-footer { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
 .entry-time { font-size: 11px; color: rgba(255,255,255,0.3); }
-.jump-btn { font-size: 11px; color: #5865f2; background: rgba(88,101,242,0.12); border: 1px solid rgba(88,101,242,0.3); padding: 3px 10px; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; }
+.jump-btn { font-size: 11px; font-family: inherit; color: #5865f2; background: rgba(88,101,242,0.12); border: 1px solid rgba(88,101,242,0.3); padding: 3px 10px; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; }
 .jump-btn:hover { background: rgba(88,101,242,0.25); }
-.chan-btn { font-size: 11px; color: rgba(255,255,255,0.45); background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); padding: 3px 10px; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; }
+.chan-btn { font-size: 11px; font-family: inherit; color: rgba(255,255,255,0.45); background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); padding: 3px 10px; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; }
 .chan-btn:hover { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.7); }
 </style>
 </head>
@@ -397,10 +398,13 @@ function renderEntries(entries) {
           return '<a href="' + esc(u) + '" target="_blank" rel="noopener noreferrer"><img src="' + esc(u) + '" onerror="this.style.display=\\'none\\'"></a>';
         }).join("") + '</div>'
       : "";
-    var jumpUrl = e.messageId ? 'discord://-/channels/' + (e.guildId || "@me") + '/' + e.channelId + '/' + e.messageId : null;
-    var chanUrl = 'discord://-/channels/' + (e.guildId || "@me") + '/' + e.channelId;
     var chanLabel = ({server:"# Open Channel",dm:"\u2709\uFE0F Open DM",call:"\uD83D\uDD0A Open Channel"})[e.type] || "Open";
-    var jumpBtn = jumpUrl ? '<a class="jump-btn" href="' + esc(jumpUrl) + '">\u2197 Jump to Message</a>' : "";
+    var guildAttr = esc(e.guildId || "");
+    var chanAttr  = esc(e.channelId);
+    var msgAttr   = e.messageId ? esc(e.messageId) : "";
+    var jumpBtn   = e.messageId
+      ? '<button class="jump-btn" data-guild="' + guildAttr + '" data-channel="' + chanAttr + '" data-message="' + msgAttr + '">\u2197 Jump to Message</button>'
+      : "";
     html += '<div class="entry">' + avatarEl +
       '<div class="entry-body">' +
         '<div class="entry-header"><span class="entry-name">' + esc(e.title) + '</span><span class="badge ' + badgeCls + '">' + badge + '</span></div>' +
@@ -409,7 +413,7 @@ function renderEntries(entries) {
         imagesHtml +
         '<div class="entry-footer"><span class="entry-time">' + esc(formatDate(e.timestamp)) + '</span>' +
           jumpBtn +
-          '<a class="chan-btn" href="' + esc(chanUrl) + '">' + chanLabel + '</a>' +
+          '<button class="chan-btn" data-guild="' + guildAttr + '" data-channel="' + chanAttr + '">' + chanLabel + '</button>' +
         '</div>' +
       '</div></div>';
   }
@@ -432,20 +436,21 @@ document.querySelectorAll(".filter").forEach(function(btn) {
 
 document.addEventListener("DOMContentLoaded", function() { loadLogs(LOG_DATA); });
 
-// Intercept discord:// link clicks via event delegation.
-// window.open() in a click handler (user gesture) reliably triggers the
-// Discord protocol handler without navigating the log viewer page away.
+// Nav buttons use data-channel/data-guild/data-message attributes.
+// Clicks are routed via IPC → native.ts → Discord's renderer (NavigationRouter),
+// bypassing discord:// protocol which may target the wrong Discord instance.
 document.getElementById("feed").addEventListener("click", function(e) {
   var el = e.target;
   while (el && el !== this) {
-    if (el.tagName === "A") {
-      var href = el.getAttribute("href");
-      if (href && href.indexOf("discord://") === 0) {
-        e.preventDefault();
-        // window.open() opens a popup which Chrome/Edge may block from file:// origins.
-        // location.href navigates the current tab to discord:// — Chrome intercepts it,
-        // triggers the registered Discord handler, and keeps the tab at the file:// URL.
-        window.location.href = href;
+    if (el.tagName === "BUTTON" && el.hasAttribute("data-channel")) {
+      var guildId   = el.getAttribute("data-guild")   || null;
+      var channelId = el.getAttribute("data-channel") || "";
+      var messageId = el.getAttribute("data-message") || null;
+      console.log("[NotifOverlay] nav button clicked — guildId=" + guildId + " channelId=" + channelId + " messageId=" + messageId + " __logViewer=" + (typeof window.__logViewer));
+      if (window.__logViewer) {
+        window.__logViewer.navigateToChannel(guildId, channelId, messageId);
+      } else {
+        console.warn("[NotifOverlay] __logViewer is not defined — preload may have failed");
       }
       return;
     }
@@ -466,9 +471,27 @@ try {
     warn("Failed to write overlay HTML —", e);
 }
 
+// Write log viewer preload to userData — avoids needing a separate file copied to dist/
+const LOG_VIEWER_PRELOAD_CONTENT = `\
+const { contextBridge, ipcRenderer } = require("electron");
+contextBridge.exposeInMainWorld("__logViewer", {
+    navigateToChannel: (guildId, channelId, messageId) => {
+        console.log("[NotifOverlay preload] navigateToChannel guildId=" + guildId + " channelId=" + channelId + " messageId=" + messageId);
+        ipcRenderer.send("log-viewer-navigate", guildId, channelId, messageId);
+    },
+});
+`;
+try {
+    writeFileSync(LOG_VIEWER_PRELOAD_FILE, LOG_VIEWER_PRELOAD_CONTENT, "utf-8");
+    log("Log viewer preload written to", LOG_VIEWER_PRELOAD_FILE);
+} catch (e) {
+    warn("Failed to write log viewer preload —", e);
+}
+
 // ─── Overlay Window ───────────────────────────────────────────────────────────
 
 let overlayWin: BrowserWindow | null = null;
+let discordWin: BrowserWindow | null = null;  // main Discord renderer window, saved on first showNotification call
 let overlayReady = false;
 let pendingNotifs: Array<NotifPayload & { imageUrls: string[]; channelId: string; guildId: string | null; messageId: string | null; maxCards: number; cardWidth: number; }> = [];
 
@@ -565,7 +588,32 @@ ipcMain.on("overlay-hide", (event) => {
     win.hide();
 });
 
+ipcMain.on("log-viewer-navigate", (_, guildId: string | null, channelId: string, messageId: string | null) => {
+    log("IPC log-viewer-navigate: guildId=" + guildId + " channelId=" + channelId + " messageId=" + messageId);
+    if (!discordWin || discordWin.isDestroyed()) {
+        warn("log-viewer-navigate: discordWin not available — cannot navigate");
+        return;
+    }
+    const js = `typeof window.__notifOverlayNavigate === "function"
+        ? (window.__notifOverlayNavigate(${JSON.stringify(guildId)}, ${JSON.stringify(channelId)}, ${JSON.stringify(messageId)}), "ok")
+        : "no handler"`;
+    discordWin.focus();
+    discordWin.webContents.executeJavaScript(js)
+        .then((r: string) => log("log-viewer-navigate: executeJavaScript result:", r))
+        .catch((e: any) => warn("log-viewer-navigate: executeJavaScript failed —", e));
+});
+
 // ─── Exports ──────────────────────────────────────────────────────────────────
+
+// Save Discord's main BrowserWindow from the IPC event of any renderer call.
+// Called at the top of every exported function so discordWin is set ASAP,
+// even if the user opens the log viewer before any notification fires.
+function saveDiscordWin(ipcEvent: any): void {
+    if (!discordWin && ipcEvent && ipcEvent.sender) {
+        const w = BrowserWindow.fromWebContents(ipcEvent.sender);
+        if (w) { discordWin = w; log("discordWin saved, id =", w.id); }
+    }
+}
 
 export function showNotification(_: any, payload: NotifPayload & {
     imageUrls: string[];
@@ -575,6 +623,7 @@ export function showNotification(_: any, payload: NotifPayload & {
     cardWidth: number;
     maxCards: number;
 }): void {
+    saveDiscordWin(_);
     log(`showNotification: type=${payload.type} title="${payload.title}" overlayReady=${overlayReady} pendingCount=${pendingNotifs.length}`);
 
     const entry: LogEntry = {
@@ -610,6 +659,7 @@ export function showNotification(_: any, payload: NotifPayload & {
 }
 
 export function trimToMaxCards(_: any, max: number): void {
+    saveDiscordWin(_);
     if (!overlayWin || overlayWin.isDestroyed()) {
         warn("trimToMaxCards: overlay window not available");
         return;
@@ -620,6 +670,7 @@ export function trimToMaxCards(_: any, max: number): void {
 }
 
 export function openLogViewer(_: any): void {
+    saveDiscordWin(_);
     log("openLogViewer: building HTML snapshot with", logEntries.length, "entries");
     let html: string;
     try {
@@ -636,11 +687,26 @@ export function openLogViewer(_: any): void {
         return;
     }
     const url = pathToFileURL(LOG_VIEWER_HTML_FILE).href;
-    log("openLogViewer: opening", url);
-    shell.openExternal(url).catch(e => warn("openLogViewer: shell.openExternal failed —", e));
+    log("openLogViewer: opening BrowserWindow for", url);
+    const logWin = new BrowserWindow({
+        width: 960,
+        height: 720,
+        title: "Notification Log",
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: false,
+            preload: LOG_VIEWER_PRELOAD_FILE,
+        },
+    });
+    logWin.loadFile(LOG_VIEWER_HTML_FILE);
+    logWin.webContents.on("did-fail-load", (_e, code, desc) => {
+        warn("openLogViewer: did-fail-load —", code, desc);
+    });
 }
 
 export function clearNotificationLog(_: any): void {
+    saveDiscordWin(_);
     log("clearNotificationLog: clearing log");
     clearLog();
 }

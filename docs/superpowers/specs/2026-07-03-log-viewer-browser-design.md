@@ -39,7 +39,8 @@ Additionally, the user prefers the log to open in the system browser rather than
 ### `buildLogViewerHtml(entries: LogEntry[]): string`
 
 Replaces the static `LOG_VIEWER_HTML` template. Differences from the current template:
-
+bridge`.
+- **Clear button removed** from the top bar.
 - **Data embedding:** `var LOG_DATA = ${safeJson(entries)};` at the top of the inline `<script>` block, where `safeJson` is:
   ```ts
   JSON.stringify(entries)
@@ -47,8 +48,7 @@ Replaces the static `LOG_VIEWER_HTML` template. Differences from the current tem
     .replace(/\u2028/g, "\\u2028")            // U+2028 LINE SEPARATOR — invalid in JS string literals
     .replace(/\u2029/g, "\\u2029");           // U+2029 PARAGRAPH SEPARATOR — same
   ```
-- **Initialisation:** `document.addEventListener("DOMContentLoaded", () => loadLogs(LOG_DATA));` — no IPC, no `__bridge`.
-- **Clear button removed** from the top bar.
+- **Initialisation:** `document.addEventListener("DOMContentLoaded", () => loadLogs(LOG_DATA));` — no IPC, no `__
 - **`discord://` links** rendered as `<a href="discord://..." >` — the OS/browser dispatches the protocol to Discord.
 - **Image thumbnails** wrapped in `<a href="..." target="_blank">` — click opens the full image in a new browser tab.
 - **No `__bridge` references** anywhere in the generated page.

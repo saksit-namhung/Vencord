@@ -3,16 +3,31 @@
  * Intercepts Discord events and sends notifications to the overlay via native IPC.
  */
 
+import { addServerListElement, removeServerListElement, ServerListRenderPosition } from "@api/ServerList";
 import { definePluginSettings } from "@api/Settings";
+import { TextButton } from "@components/Button";
+import ErrorBoundary from "@components/ErrorBoundary";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { Button } from "@webpack/common";
 import { findByCodeLazy, findLazy } from "@webpack";
-import { ChannelStore, GuildStore, UserStore } from "@webpack/common";
+import { ChannelStore, GuildStore, NavigationRouter, UserStore } from "@webpack/common";
 
 const ChannelTypes = findLazy(m => m.ANNOUNCEMENT_THREAD === 10);
 const notificationsShouldNotify = findByCodeLazy(".SUPPRESS_NOTIFICATIONS))return!1");
 
 const Native = VencordNative.pluginHelpers.NotificationOverlay as PluginNative<typeof import("./native")>;
+
+// ─── Server list quick-access button ─────────────────────────────────────────
+
+const NotifLogButton = () => (
+    <TextButton
+        variant="secondary"
+        onClick={() => Native.openLogViewer()}
+        style={{ color: "var(--interactive-icon-default)", padding: "0 0.5em", width: "100%", fontSize: "14px", whiteSpace: "nowrap", boxSizing: "border-box" }}
+    >
+        📋 Noti
+    </TextButton>
+);
 
 // ─── Debug logger ─────────────────────────────────────────────────────────────
 
@@ -114,7 +129,10 @@ export default definePlugin({
     name: "NotificationOverlay",
     description: "Shows Discord notifications as an always-on-top overlay visible over any app or window, with a persistent notification log",
     authors: [{ name: "Me", id: 0n }], // personal userplugin — matches existing plugin convention
+    dependencies: ["ServerListAPI"],
     settings,
+
+    renderNotifLogButton: ErrorBoundary.wrap(NotifLogButton, { noop: true }),
 
     start() {
         if (!Native || typeof Native.showNotification !== "function") {
@@ -122,6 +140,25 @@ export default definePlugin({
         } else {
             log("start: Native.showNotification OK");
         }
+        addServerListElement(ServerListRenderPosition.Above, this.renderNotifLogButton);
+        // Register global handler so native.ts can navigate Discord via executeJavaScript.
+        // This avoids discord:// protocol which may target the wrong Discord instance.
+        (window as any).__notifOverlayNavigate = (guildId: string | null, channelId: string, messageId: string | null) => {
+            try {
+                const path = guildId && guildId !== ""
+                    ? `/channels/${guildId}/${channelId}${messageId ? `/${messageId}` : ""}`
+                    : `/channels/@me/${channelId}`;
+                log("navigate: transitioning to", path);
+                NavigationRouter.transitionTo(path);
+            } catch (e) {
+                warn("navigate: NavigationRouter.transitionTo failed —", e);
+            }
+        };
+    },
+
+    stop() {
+        removeServerListElement(ServerListRenderPosition.Above, this.renderNotifLogButton);
+        delete (window as any).__notifOverlayNavigate;
     },
 
     flux: {
