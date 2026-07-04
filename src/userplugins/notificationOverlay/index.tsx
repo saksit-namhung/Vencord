@@ -81,6 +81,15 @@ const settings = definePluginSettings({
             </Button>
         ),
     },
+    clearLog: {
+        type: OptionType.COMPONENT,
+        description: "Clear all saved notification history",
+        component: () => (
+            <Button color={Button.Colors.RED} onClick={() => Native.clearNotificationLog()}>
+                🗑 Clear Notification Log
+            </Button>
+        ),
+    },
 });
 
 // ─── Call dedup state ─────────────────────────────────────────────────────────
