@@ -382,12 +382,19 @@ function renderEntries(entries) {
     if (day !== lastDay) { html += '<div class="day-divider"><span>' + esc(day) + '</span></div>'; lastDay = day; }
     var badge = ({server:"Server",dm:"DM",call:"Call"})[e.type] || e.type;
     var badgeCls = "badge-" + e.type;
+    var avatarBg = e.type==="call" ? "#ed4245" : e.type==="dm" ? "#3ba55d" : "#5865f2";
+    var avatarIcon = e.type==="call" ? "&#x1F4DE;" : e.type==="dm" ? "&#x2709;&#xFE0F;" : "&#x1F4AC;";
+    // Stacking approach: fallback emoji sits behind the img; onerror removes the img, revealing the emoji.
+    // onerror="this.remove()" has no inner quotes — avoids all JS/HTML escaping layers.
     var avatarEl = e.avatarUrl
-      ? '<img class="avatar" src="' + esc(e.avatarUrl) + '" onerror="this.outerHTML=\'<div class=\\"avatar\\" style=\\"background:#5865f2;font-size:20px;\\">&#x1F4AC;</div>\'">'
-      : '<div class="avatar" style="background:' + (e.type==="call"?"#ed4245":e.type==="dm"?"#3ba55d":"#5865f2") + ';font-size:20px;">' + (e.type==="call"?"&#x1F4DE;":e.type==="dm"?"&#x2709;&#xFE0F;":"&#x1F4AC;") + '</div>';
+      ? ('<div class="avatar" style="position:relative;background:' + avatarBg + ';font-size:20px;">' +
+          avatarIcon +
+          '<img style="position:absolute;inset:0;width:100%;height:100%;border-radius:50%;object-fit:cover;" src="' + esc(e.avatarUrl) + '" onerror="this.remove()">' +
+        '</div>')
+      : '<div class="avatar" style="background:' + avatarBg + ';font-size:20px;">' + avatarIcon + '</div>';
     var imagesHtml = (e.imageUrls && e.imageUrls.length)
       ? '<div class="entry-images">' + e.imageUrls.map(function(u) {
-          return '<a href="' + esc(u) + '" target="_blank" rel="noopener noreferrer"><img src="' + esc(u) + '" onerror="this.style.display=\'none\'"></a>';
+          return '<a href="' + esc(u) + '" target="_blank" rel="noopener noreferrer"><img src="' + esc(u) + '" onerror="this.style.display=\\'none\\'"></a>';
         }).join("") + '</div>'
       : "";
     var jumpUrl = e.messageId ? 'discord://-/channels/' + (e.guildId || "@me") + '/' + e.channelId + '/' + e.messageId : null;
