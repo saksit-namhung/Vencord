@@ -1,6 +1,7 @@
 ﻿/*
- * NotificationOverlay — index.tsx (renderer)
- * Intercepts Discord events and sends notifications to the overlay via native IPC.
+ * Vencord, a Discord client mod
+ * Copyright (c) 2024 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 import { addServerListElement, removeServerListElement, ServerListRenderPosition } from "@api/ServerList";
@@ -8,12 +9,52 @@ import { definePluginSettings } from "@api/Settings";
 import { TextButton } from "@components/Button";
 import ErrorBoundary from "@components/ErrorBoundary";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
-import { Button } from "@webpack/common";
-import { findByCodeLazy, findLazy } from "@webpack";
-import { ChannelStore, GuildStore, NavigationRouter, UserStore } from "@webpack/common";
+import { findLazy } from "@webpack";
+import { Button, ChannelStore, GuildStore, NavigationRouter, UserGuildSettingsStore, UserStore } from "@webpack/common";
 
 const ChannelTypes = findLazy(m => m.ANNOUNCEMENT_THREAD === 10);
-const notificationsShouldNotify = findByCodeLazy(".SUPPRESS_NOTIFICATIONS))return!1");
+
+// Discord's UserNotificationSetting enum values
+const enum NotifSetting { ALL_MESSAGES = 0, ONLY_MENTIONS = 1, NO_MESSAGES = 2 }
+// Message flag bit for SUPPRESS_NOTIFICATIONS
+const SUPPRESS_NOTIF_FLAG = 1 << 12;
+
+/**
+ * Determine whether to show an overlay notification for a message.
+ * Uses UserGuildSettingsStore directly instead of Discord's internal shouldNotify,
+ * which can break across Discord updates and suppresses when the window is focused.
+ */
+function checkShouldNotify(message: any, channel: any, currentUserId: string): boolean {
+    // Message explicitly opted out of notifications
+    if (message.flags & SUPPRESS_NOTIF_FLAG) return false;
+
+    const guildId: string | null = channel.guild_id ?? null;
+
+    if (!guildId) {
+        // DM / Group DM — always notify unless the conversation is muted
+        return !UserGuildSettingsStore.isChannelMuted("", channel.id);
+    }
+
+    // Server channel — respect mute + notification mode
+    if (UserGuildSettingsStore.isGuildOrCategoryOrChannelMuted(guildId, channel.id)) return false;
+
+    const setting: number = UserGuildSettingsStore.resolvedMessageNotifications(channel) as number;
+
+    if (setting === NotifSetting.NO_MESSAGES) return false;
+
+    if (setting === NotifSetting.ONLY_MENTIONS) {
+        // Direct @mention
+        if (message.mentions?.some((m: any) => m.id === currentUserId)) return true;
+        // @everyone / @here (unless the guild suppresses it)
+        if (message.mention_everyone && !UserGuildSettingsStore.isSuppressEveryoneEnabled(guildId)) return true;
+        // Role mention — treat any mentioned role as a potential match (avoids needing member data)
+        if (message.mention_roles?.length > 0) return true;
+        return false;
+    }
+
+    // ALL_MESSAGES (0) or unrecognised value
+    return true;
+}
 
 const Native = VencordNative.pluginHelpers.NotificationOverlay as PluginNative<typeof import("./native")>;
 
@@ -42,13 +83,13 @@ function warn(...args: any[]): void {
 
 function stripMarkup(s: string): string {
     return s
-        .replace(/<@!?(\d+)>/g,      "@user")
-        .replace(/<#(\d+)>/g,        "#channel")
-        .replace(/<@&(\d+)>/g,       "@role")
-        .replace(/<a?:[^:]+:\d+>/g,  "[emoji]")
-        .replace(/\*\*(.+?)\*\*/gs,  "$1")
-        .replace(/__(.+?)__/gs,      "$1")
-        .replace(/`(.+?)`/gs,        "$1");
+        .replace(/<@!?(\d+)>/g, "@user")
+        .replace(/<#(\d+)>/g, "#channel")
+        .replace(/<@&(\d+)>/g, "@role")
+        .replace(/<a?:[^:]+:\d+>/g, "[emoji]")
+        .replace(/\*\*(.+?)\*\*/gs, "$1")
+        .replace(/__(.+?)__/gs, "$1")
+        .replace(/`(.+?)`/gs, "$1");
 }
 
 // ─── Settings ────────────────────────────────────────────────────────────────
@@ -176,19 +217,19 @@ export default definePlugin({
                 const channel = ChannelStore.getChannel(channelId);
                 log("CALL_UPDATE: firing showNotification for call");
                 Native.showNotification({
-                    id:          makeId(),
-                    title:       "📞 Incoming Call",
-                    serverLine:  "Voice Chat",
-                    body:        `${channel?.name ?? "Someone"} is calling you...`,
-                    avatarUrl:   "",
-                    type:        "call",
-                    timeout:     settings.store.timeout,
-                    cardWidth:   settings.store.cardWidth,
-                    maxCards:    settings.store.maxCards,
-                    imageUrls:   [],
-                    channelId:   channelId,
-                    guildId:     channel?.guild_id ?? null,
-                    messageId:   null,
+                    id: makeId(),
+                    title: "📞 Incoming Call",
+                    serverLine: "Voice Chat",
+                    body: `${channel?.name ?? "Someone"} is calling you...`,
+                    avatarUrl: "",
+                    type: "call",
+                    timeout: settings.store.timeout,
+                    cardWidth: settings.store.cardWidth,
+                    maxCards: settings.store.maxCards,
+                    imageUrls: [],
+                    channelId: channelId,
+                    guildId: channel?.guild_id ?? null,
+                    messageId: null,
                 }).catch((e: any) => warn("CALL_UPDATE: showNotification IPC rejected —", e));
             }
             if (!isRinging) {
@@ -204,15 +245,17 @@ export default definePlugin({
             if (message.author?.id === currentUser.id) { log("MESSAGE_CREATE: skipped — own message"); return; }
             if (message.author?.bot) { log("MESSAGE_CREATE: bot message — allowed"); }
 
-            const shouldNotify = notificationsShouldNotify(message, message.channel_id);
-            if (!shouldNotify) { log(`MESSAGE_CREATE: skipped — notificationsShouldNotify returned false (channelId=${message.channel_id})`); return; }
-
             const channel = ChannelStore.getChannel(message.channel_id);
             if (!channel) { warn(`MESSAGE_CREATE: skipped — channel not found (id=${message.channel_id})`); return; }
 
-            const isDM      = channel.type === ChannelTypes.DM;
+            if (!checkShouldNotify(message, channel, currentUser.id)) {
+                log(`MESSAGE_CREATE: skipped — muted/suppressed (channelId=${message.channel_id})`);
+                return;
+            }
+
+            const isDM = channel.type === ChannelTypes.DM;
             const isGroupDM = channel.type === ChannelTypes.GROUP_DM;
-            const isServer  = !isDM && !isGroupDM;
+            const isServer = !isDM && !isGroupDM;
 
             if ((isDM || isGroupDM) && !settings.store.dmNotifications) { log("MESSAGE_CREATE: skipped — dmNotifications disabled"); return; }
             if (isServer && !settings.store.serverNotifications) { log("MESSAGE_CREATE: skipped — serverNotifications disabled"); return; }
@@ -238,9 +281,9 @@ export default definePlugin({
             // Build body
             let body = message.content || "";
             if (!body && message.sticker_items?.length) body = "📌 Sent a sticker";
-            if (!body && message.attachments?.length)   body = "📎 Sent an attachment";
-            if (!body && message.embeds?.length)         body = "🔗 Sent an embed";
-            if (!body)                                   body = "(no content)";
+            if (!body && message.attachments?.length) body = "📎 Sent an attachment";
+            if (!body && message.embeds?.length) body = "🔗 Sent an embed";
+            if (!body) body = "(no content)";
             body = stripMarkup(body);
 
             const avatarUrl = message.author?.avatar
@@ -248,19 +291,19 @@ export default definePlugin({
                 : "";
 
             Native.showNotification({
-                id:          makeId(),
+                id: makeId(),
                 title,
                 serverLine,
                 body,
                 avatarUrl,
-                type:        isServer ? "server" : "dm",
-                timeout:     settings.store.timeout,
-                cardWidth:   settings.store.cardWidth,
-                maxCards:    settings.store.maxCards,
-                imageUrls:   getImageUrls(message),
-                channelId:   message.channel_id,
-                guildId:     channel.guild_id ?? null,
-                messageId:   message.id ?? null,
+                type: isServer ? "server" : "dm",
+                timeout: settings.store.timeout,
+                cardWidth: settings.store.cardWidth,
+                maxCards: settings.store.maxCards,
+                imageUrls: getImageUrls(message),
+                channelId: message.channel_id,
+                guildId: channel.guild_id ?? null,
+                messageId: message.id ?? null,
             }).catch((e: any) => warn("MESSAGE_CREATE: showNotification IPC rejected —", e));
         },
     },
