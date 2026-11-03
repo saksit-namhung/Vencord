@@ -24,3 +24,7 @@ src/userplugins
 
 ExtensionCache/
 /settings
+
+# local tooling / notes
+.superpowers/
+manualLogs.txt
